@@ -31,7 +31,7 @@ for fn in sorted(os.listdir(src)):
         r = xbox_shader.code_range(spec, f)
         if not r: fails["code not found"] += 1; continue
         code = f[r[0]:r[1]]
-    try: hl = rdna2hlsl.translate(spec, code, stage, 16)
+    try: hl = rdna2hlsl.translate(spec, code, stage, 32)
     except rdna2hlsl.Unsupported as e: fails["unsupported: %s" % e] += 1; continue
     hp = os.path.join(out, "%s.%s.hlsl" % (h, stage)); open(hp, "w", newline="\n").write(hl)
     res = subprocess.run([dxc, "-T", "%s_6_6" % stage, "-E", "main", "-Fo", os.path.join(out, "%s.%s.cso" % (h, stage)), hp], capture_output=True, text=True)

@@ -276,3 +276,17 @@ static BOOL WINAPI h_VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
     }
     return VirtualFree(addr, size, type);
 }
+/* GPU-visible scratch memory for the D3D12 stand-in (per-draw tables it builds itself, e.g. vertex buffer descriptors):
+   a placeholder range below 4 GB backed page by page with pool pages, so the GPU reads it through the page table. */
+EXP void* xmem_gpu_scratch(size_t size) {
+    if (!gpumem_on() || !va2()) return NULL;
+    size = (size + 0xFFFF) & ~(size_t)0xFFFF;
+    MEM_ADDRESS_REQUIREMENTS req = { 0 }; req.LowestStartingAddress = (PVOID)0x80000000ull; req.HighestEndingAddress = (PVOID)0xFFFFFFFFull;
+    MEM_EXTENDED_PARAMETER ep = { 0 }; ep.Type = MemExtendedParameterAddressRequirements; ep.Pointer = &req;
+    uint8_t* p = (uint8_t*)va2()(NULL, NULL, size, MEM_RESERVE | X_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &ep, 1);
+    if (!p) p = (uint8_t*)va2()(NULL, NULL, size, MEM_RESERVE | X_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
+    if (!p) return NULL;
+    for (size_t o = 0; o < size; o += 0x10000) if (!gm_map_page((uint64_t)p + o, (uint64_t)InterlockedIncrement64(&g_nextpfn))) { SLOG("xmem_gpu_scratch: map failed", p, o, size, 0, 0, 0); return NULL; }
+    SLOG("xmem_gpu_scratch (size, address)", size, 0, 0, 0, 0, p);
+    return p;
+}

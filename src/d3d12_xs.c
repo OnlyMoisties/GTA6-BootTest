@@ -89,7 +89,7 @@ typedef struct { void* p; int parent, slot, kind; GUID iid; void* aux; void* met
    Pipeline objects keep meta = PsoMeta (shader code, size, hash, copy of the creation desc). */
 typedef struct { int n; uint8_t kind[64]; uint16_t val[64]; } RootLayout;   /* root signature parameters (rg_rootsig_info) */
 typedef struct { uint64_t code, size, hash; uint8_t desc[0x180]; uint32_t regs[7]; int hasregs; const void* vs; const void* ps; size_t vslen, pslen; uint64_t vhash, phash; } PsoMeta;
-void rg_queue_xlat_draw(uint64_t vh, uint64_t ph, const uint32_t* user16, uint64_t base, const void* win, uint32_t winlen, uint32_t verts, uint32_t insts, const float* vp);
+void rg_queue_xlat_draw(uint64_t vh, uint64_t ph, const uint32_t* vsc, const uint32_t* psc, uint32_t verts, uint32_t insts, int prim, const float* vp);
 void rg_queue_dxil_draw(const void* vs, size_t vslen, const void* ps, size_t pslen, const void* srv, uint32_t srvlen, uint32_t verts, uint32_t insts, const float* vp);
 typedef struct { uint8_t* buf; size_t used, cap; } CmdRec;
 /* Resources keep meta = ResMeta (their D3D12_RESOURCE_DESC); memory stays in aux. */
@@ -238,6 +238,25 @@ static uint64_t heap_lowgpu(int id) {
     ReleaseSRWLockExclusive(&lk);
     return g_heaplow[id];
 }
+/* Vertex buffer descriptor table for a main-renderer draw: one 16-byte AMD buffer descriptor (V#) per IA slot, built
+   from the recorded IASetVertexBuffers views {address, size, stride} in a GPU-visible scratch ring (xmem_gpu_scratch). */
+static uint8_t* vb_table(uint32_t vb[32][4]) {
+    static uint8_t* ring; static volatile LONG64 pos; static int tried; const LONG64 RING = 16 << 20;
+    if (!tried) { tried = 1; HMODULE x = GetModuleHandleA("xmem.dll"); typedef void* (*ScrFn)(size_t);
+        ScrFn f = x ? (ScrFn)GetProcAddress(x, "xmem_gpu_scratch") : NULL; ring = f ? (uint8_t*)f((size_t)RING) : NULL;
+        dlog("vertex buffer table ring: %p", ring); }
+    if (!ring) return NULL;
+    LONG64 o = InterlockedAdd64(&pos, 32 * 16) - 32 * 16; o %= RING; if (o + 32 * 16 > RING) o = 0;
+    uint32_t* t = (uint32_t*)(ring + o);
+    for (int i = 0; i < 32; i++) {
+        uint64_t base = ((uint64_t)vb[i][1] << 32) | vb[i][0]; uint32_t size = vb[i][2], stride = vb[i][3] & 0x3FFF;
+        t[i * 4 + 0] = (uint32_t)base;
+        t[i * 4 + 1] = (uint32_t)((base >> 32) & 0xFFFF) | (stride << 16);
+        t[i * 4 + 2] = stride ? size / stride : size;                    /* num_records: elements when strided */
+        t[i * 4 + 3] = 0x3104DFAC;                                       /* dst_sel xyzw, 32_32_32_32 float, gfx10 resource level 1, oob structured */
+    }
+    return (uint8_t*)t;
+}
 static uint64_t gpu2cpu(uint64_t a) {                             /* low GPU alias -> CPU address (for our own CPU-side readers) */
     GpuMem* g = gmem(); if (!g || a >= 0x100000000ull) return a;
     for (long i = 0; i < g->nalias; i++) if (a >= g->alias[i].gpu && a < g->alias[i].gpu + g->alias[i].size) return g->alias[i].cpu + (a - g->alias[i].gpu);
@@ -358,7 +377,7 @@ static void replay_list(int lid) {
     CmdRec* r = (CmdRec*)g_obj[lid].meta;
     int pso = -1, rootsig = -1; uint64_t tables[16] = { 0 }, views[16] = { 0 }, heaps[2] = { 0 }; uint32_t consts[16][64]; uint32_t cmask[16] = { 0 };
     float gvp[6] = { 0, 0, 3840, 2160, 0, 1 }; uint64_t groot0 = 0;
-    int grs = -1; uint64_t gtab[16] = { 0 }, gview[16] = { 0 }; uint32_t gconst[16][64] = { 0 }; uint32_t gib[4] = { 0 }; uint32_t gvb[32][4] = { 0 };   /* graphics root + IA state */
+    int gprim = 4; int grs = -1; uint64_t gtab[16] = { 0 }, gview[16] = { 0 }; uint32_t gconst[16][64] = { 0 }; uint32_t gib[4] = { 0 }; uint32_t gvb[32][4] = { 0 };   /* graphics root + IA state */
     static volatile LONG logged; static uint64_t seen[4096]; static LONG nseen;
     for (size_t off = 0; off + sizeof(RecHdr) <= r->used;) {
         RecHdr* h = (RecHdr*)(r->buf + off); const uint32_t* ex = (const uint32_t*)(h + 1);
@@ -406,6 +425,24 @@ static void replay_list(int lid) {
                 dlog("DRAWLOG   tables %llX %llX %llX %llX  views %llX %llX  consts1 %08X %08X  ib %08X%08X size %X fmt %X",
                     gtab[0], gtab[1], gtab[2], gtab[3], gview[0], gview[1], gconst[1][0], gconst[1][1], gib[1], gib[0], gib[2], gib[3]);
                 for (int v = 0; v < 4; v++) if (gvb[v][0] || gvb[v][1]) dlog("DRAWLOG   vb%d addr %08X%08X size %X stride %X", v, gvb[v][1], gvb[v][0], gvb[v][2], gvb[v][3]);
+                {   /* once: raw dump of the first linear 2D texture in table 0 (T# at +0x20) -> <logs>\tex_<w>x<h>_f<fmt>.raw */
+                    static volatile LONG dumped; uint64_t c = gpu2cpu(gtab[0]);
+                    if (gtab[0] && readable(c + 0x20, 32)) {
+                        const uint32_t* tq = (const uint32_t*)(c + 0x20);
+                        uint64_t tb = ((uint64_t)tq[0] | ((uint64_t)(tq[1] & 0xFF) << 32)) << 8;
+                        uint32_t fmt = (tq[1] >> 20) & 0x1FF, w = (tq[2] & 0x3FFF) + 1, hh = ((tq[2] >> 14) & 0x3FFF) + 1, type = tq[3] >> 28, swm = (tq[3] >> 20) & 31;
+                        dlog("DRAWLOG   T# base %llX %ux%u format %u type %u swizzle %u", tb, w, hh, fmt, type, swm);
+                        size_t bytes = (size_t)w * hh * 4;
+                        if (type == 9 && swm == 0 && bytes <= (64u << 20) && readable(tb, bytes) && !InterlockedExchange(&dumped, 1)) {
+                            char path[MAX_PATH]; char* sl;
+                            if (GetEnvironmentVariableA("GTA6_STUB_LOG", path, MAX_PATH) && (sl = strrchr(path, '\\')) != NULL) {
+                                snprintf(sl + 1, MAX_PATH - (sl + 1 - path), "tex_%ux%u_f%u.raw", w, hh, fmt);
+                                HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+                                if (f != INVALID_HANDLE_VALUE) { DWORD wr; WriteFile(f, (void*)tb, (DWORD)bytes, &wr, NULL); CloseHandle(f); dlog("DRAWLOG   texture dumped to %s", path); }
+                            }
+                        }
+                    }
+                }
                 for (int t = 0; t < 2; t++) {
                     uint64_t c = gpu2cpu(gtab[t]);
                     if (gtab[t] && readable(c, 128)) { const uint32_t* q = (const uint32_t*)c;
@@ -414,21 +451,40 @@ static void replay_list(int lid) {
                 }
             }
         }
-        if ((h->slot == 12) && pso > 0) {
+        if ((h->slot == 12 || h->slot == 13) && pso > 0) {
             PsoMeta* gm = (PsoMeta*)g_obj[pso].meta;
-            /* translated path: the game's RDNA2 shaders, translated offline to DXIL (tools/xlat_all.py), keyed by container hash */
-            if (gm && gm->vs && gm->ps && readable(groot0, 256) && GetEnvironmentVariableA("GTA6_XLAT_DIR", NULL, 0)) {
+            /* translated path: the game's RDNA2 shaders, translated offline to DXIL (tools/xlat_all.py), keyed by code hash */
+            static int xl = -1; if (xl < 0) xl = GetEnvironmentVariableA("GTA6_XLAT_DIR", NULL, 0) ? 1 : 0;
+            if (xl && gm && gm->vs && gm->ps) {
                 if (!gm->vhash) { uint64_t a = 1469598103934665603ull, b = a;
                     for (size_t i = 0; i < gm->vslen; i++) { a ^= ((const uint8_t*)gm->vs)[i]; a *= 1099511628211ull; }
                     for (size_t i = 0; i < gm->pslen; i++) { b ^= ((const uint8_t*)gm->ps)[i]; b *= 1099511628211ull; }
                     gm->vhash = a; gm->phash = b; }
-                uint32_t user[16] = { 0 }; user[8] = (uint32_t)groot0; user[9] = (uint32_t)(groot0 >> 32);   /* VS: s[8:9] = root buffer address */
-                uint32_t len = readable(groot0, 4096) ? 4096 : 256;
-                rg_queue_xlat_draw(gm->vhash, gm->phash, user, groot0, (const void*)groot0, len, (uint32_t)h->a[0], (uint32_t)h->a[1], gvp);
+                uint32_t vsc[36] = { 0 }, psc[36] = { 0 }; int indexed = (h->slot == 13); int ok = 1;
+                if (g_obj[pso].slot == 57) {
+                    /* main renderer: s[0:1] = vertex buffer descriptor table (40-bit), s2 = base vertex, s3 = start instance,
+                       s8 = low 32 bits of root table 0 (the title's per-draw table of AMD descriptors, below 4 GB) */
+                    uint8_t* tbl = vb_table(gvb);
+                    if (!tbl) ok = 0;
+                    else { vsc[0] = (uint32_t)(uint64_t)tbl; vsc[1] = (uint32_t)((uint64_t)tbl >> 32) & 0xFF; }
+                    vsc[2] = (uint32_t)(indexed ? h->a[3] : h->a[2]); vsc[3] = (uint32_t)(indexed ? h->a[4] : h->a[3]);
+                    vsc[8] = psc[8] = (uint32_t)gtab[0];
+                    if (indexed) {                                        /* index buffer view {address, size, format}; 42 = R32_UINT */
+                        uint64_t ib = ((uint64_t)gib[1] << 32) | gib[0]; int i32 = (gib[3] == 42);
+                        ib += (uint64_t)(uint32_t)h->a[2] * (i32 ? 4 : 2);
+                        vsc[32] = (uint32_t)ib; vsc[33] = (uint32_t)(ib >> 32); vsc[34] = 1u | (i32 ? 2u : 0u);
+                        if (!gib[0] && !gib[1]) ok = 0;
+                    }
+                } else {
+                    /* exe-embedded (slot 86) shaders: VS s[8:9] = root SRV 0 */
+                    vsc[8] = (uint32_t)groot0; vsc[9] = (uint32_t)(groot0 >> 32);
+                    if (!groot0) ok = 0;
+                }
+                if (ok) rg_queue_xlat_draw(gm->vhash, gm->phash, vsc, psc, (uint32_t)h->a[0], (uint32_t)h->a[1], gprim, gvp);
             }
             /* off by default: the exe's "DXIL" shaders are shells (NOBC) - the PC driver can't compile them */
             static int trydxil = -1; if (trydxil < 0) trydxil = GetEnvironmentVariableA("GTA6_TRY_DXIL", NULL, 0) ? 1 : 0;
-            if (trydxil && gm && gm->vs && gm->ps && readable(groot0, 256)) {
+            if (trydxil && gm && gm->vs && gm->ps && h->slot == 12 && readable(groot0, 256)) {
                 uint32_t len = readable(groot0, 4096) ? 4096 : 256;
                 rg_queue_dxil_draw(gm->vs, gm->vslen, gm->ps, gm->pslen, (const void*)groot0, len, (uint32_t)h->a[0], (uint32_t)h->a[1], gvp);
             }
@@ -440,6 +496,7 @@ static void replay_list(int lid) {
         case 28: for (uint32_t i = 0; i < h->nextra / 2 && i < 2; i++) heaps[i] = ((const uint64_t*)ex)[i]; break;
         case 35: if (h->a[0] < 16) tables[h->a[0]] = gpu2cpu(h->a[1]); break;   /* SetComputeRootDescriptorTable */
         case 34: grs = objid(h->a[0]); break;                                    /* SetGraphicsRootSignature */
+        case 20: gprim = (int)h->a[0]; break;                                     /* IASetPrimitiveTopology */
         case 36: if (h->a[0] < 16) gtab[h->a[0]] = h->a[1]; break;              /* SetGraphicsRootDescriptorTable (GPU handle, low alias) */
         case 38: if (h->a[0] < 16 && h->a[2] < 64) gconst[h->a[0]][h->a[2]] = (uint32_t)h->a[1]; break;
         case 40: if (h->a[0] < 16) for (uint32_t i = 0; i < h->nextra && h->a[3] + i < 64; i++) gconst[h->a[0]][h->a[3] + i] = ex[i]; break;

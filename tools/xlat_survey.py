@@ -19,7 +19,7 @@ for fn in files[::max(1, len(files) // want)]:
     except OSError: continue
     e = raw.find(b"\x00\x00\x81\xbf"); code = raw[:e + 4] if e >= 0 else raw
     st = rdna2hlsl.detect_stage(spec, code); n[st] += 1
-    try: hl = rdna2hlsl.translate(spec, code, st, 16); ok[st] += 1
+    try: hl = rdna2hlsl.translate(spec, code, st, 32); ok[st] += 1
     except rdna2hlsl.Unsupported as x: fails[str(x)] += 1; continue
     if dxc and comp < ncomp:
         comp += 1
