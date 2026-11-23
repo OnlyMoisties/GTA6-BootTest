@@ -136,7 +136,17 @@ EXP void* XMemVirtualAlloc(void* addr, size_t size, uint64_t type, uint64_t a4, 
     DWORD lowprot = (DWORD)(a5 & 0xFF);
     DWORD prot = (lowprot == 1 || lowprot == 2 || lowprot == 4 || lowprot == 0x10 || lowprot == 0x20 || lowprot == 0x40) ? lowprot : prot_of(a4, a5);
     if ((type & X_RESERVE_PLACEHOLDER) && va2()) {
-        void* p = va2()(NULL, addr, size, MEM_RESERVE | X_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
+        void* p = NULL;
+        /* The title's own placeholder ranges hold its GPU heaps (per-draw root tables, descriptors). Its shaders keep pointers
+           into them as 32 bits (high half hard-coded 0), so like the console they must sit below 4 GB: ask for 2-4 GB
+           (0x10000000-0x7FFFFFFF stays free for the GPU-only descriptor heap aliases). GTA6_NO_LOW32=1 turns this off. */
+        if (!addr && !GetEnvironmentVariableA("GTA6_NO_LOW32", NULL, 0)) {
+            MEM_ADDRESS_REQUIREMENTS req = { 0 }; req.LowestStartingAddress = (PVOID)0x80000000ull; req.HighestEndingAddress = (PVOID)0xFFFFFFFFull;
+            MEM_EXTENDED_PARAMETER ep = { 0 }; ep.Type = MemExtendedParameterAddressRequirements; ep.Pointer = &req;
+            p = va2()(NULL, NULL, size, MEM_RESERVE | X_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &ep, 1);
+            if (!p) slog_("placeholder below 4 GB failed (size, error) - falling back to anywhere", 0, size, GetLastError(), 0, 0, 0, 0);
+        }
+        if (!p) p = va2()(NULL, addr, size, MEM_RESERVE | X_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
         SLOG("XMemVirtualAlloc[placeholder]", addr, size, type, a4, a5, p); return p;
     }
     if ((type & X_REPLACE_PLACEHOLDER) && va2()) {

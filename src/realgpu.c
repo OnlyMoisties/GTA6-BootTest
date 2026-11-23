@@ -462,3 +462,37 @@ int rg_present_clear(const float* rgba) {
     static int bad; if (FAILED(hr) && bad++ < 5) rlog("Present failed 0x%08lX", hr);
     return SUCCEEDED(hr);
 }
+
+/* ---- root signature layouts: the game serializes with the PC D3D12; decode the blob it hands to CreateRootSignature ----
+   Fills kind[i] (0 table, 1 constants, 2 CBV, 3 SRV, 4 UAV) and val[i] (constants: count; table: number of ranges) and a
+   readable summary. Returns the parameter count, or -1. */
+int rg_rootsig_info(const void* blob, size_t len, uint8_t* kind, uint16_t* val, int maxp, char* out, size_t cap) {
+    ID3D12RootSignatureDeserializer* ds = NULL; size_t k = 0; out[0] = 0;
+    if (!blob || !len || FAILED(D3D12CreateRootSignatureDeserializer(blob, len, &IID_ID3D12RootSignatureDeserializer, (void**)&ds))) return -1;
+    const D3D12_ROOT_SIGNATURE_DESC* d = ID3D12RootSignatureDeserializer_GetRootSignatureDesc(ds);
+    int n = (int)d->NumParameters;
+    static const char* vis[] = { "all", "vs", "hs", "ds", "gs", "ps", "as", "ms" };
+    k += snprintf(out + k, cap - k, "%d params, %u static samplers, flags 0x%X:", n, d->NumStaticSamplers, d->Flags);
+    for (int i = 0; i < n && k + 80 < cap; i++) {
+        const D3D12_ROOT_PARAMETER* p = &d->pParameters[i]; const char* v = p->ShaderVisibility < 8 ? vis[p->ShaderVisibility] : "?";
+        switch (p->ParameterType) {
+        case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: {
+            if (i < maxp) { kind[i] = 0; val[i] = (uint16_t)p->DescriptorTable.NumDescriptorRanges; }
+            k += snprintf(out + k, cap - k, " [%d]T(%s", i, v);
+            for (UINT r = 0; r < p->DescriptorTable.NumDescriptorRanges && k + 40 < cap; r++) {
+                const D3D12_DESCRIPTOR_RANGE* g = &p->DescriptorTable.pDescriptorRanges[r];
+                static const char* rt = "SUCS"; k += snprintf(out + k, cap - k, " %c%u@%u.%u+%d", rt[g->RangeType & 3], g->NumDescriptors, g->BaseShaderRegister, g->RegisterSpace, (int)g->OffsetInDescriptorsFromTableStart);
+            }
+            k += snprintf(out + k, cap - k, ")"); break; }
+        case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+            if (i < maxp) { kind[i] = 1; val[i] = (uint16_t)p->Constants.Num32BitValues; }
+            k += snprintf(out + k, cap - k, " [%d]C%u@b%u.%u(%s)", i, p->Constants.Num32BitValues, p->Constants.ShaderRegister, p->Constants.RegisterSpace, v); break;
+        default: {
+            int t = p->ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ? 2 : p->ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ? 3 : 4;
+            if (i < maxp) { kind[i] = (uint8_t)t; val[i] = 0; }
+            k += snprintf(out + k, cap - k, " [%d]%s@%u.%u(%s)", i, t == 2 ? "CBV" : t == 3 ? "SRV" : "UAV", p->Descriptor.ShaderRegister, p->Descriptor.RegisterSpace, v); }
+        }
+    }
+    ID3D12RootSignatureDeserializer_Release(ds);
+    return n;
+}

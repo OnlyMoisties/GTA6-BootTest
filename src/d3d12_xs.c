@@ -87,6 +87,7 @@ typedef struct { void* p; int parent, slot, kind; GUID iid; void* aux; void* met
 /* ---- command recording (emulator step 1) ----
    Command lists keep a record buffer: {u32 slot, u32 nextra, u64 a[6]} followed by nextra extra dwords (copied data).
    Pipeline objects keep meta = PsoMeta (shader code, size, hash, copy of the creation desc). */
+typedef struct { int n; uint8_t kind[64]; uint16_t val[64]; } RootLayout;   /* root signature parameters (rg_rootsig_info) */
 typedef struct { uint64_t code, size, hash; uint8_t desc[0x180]; uint32_t regs[7]; int hasregs; const void* vs; const void* ps; size_t vslen, pslen; uint64_t vhash, phash; } PsoMeta;
 void rg_queue_xlat_draw(uint64_t vh, uint64_t ph, const uint32_t* user16, uint64_t base, const void* win, uint32_t winlen, uint32_t verts, uint32_t insts, const float* vp);
 void rg_queue_dxil_draw(const void* vs, size_t vslen, const void* ps, size_t pslen, const void* srv, uint32_t srvlen, uint32_t verts, uint32_t insts, const float* vp);
@@ -126,6 +127,7 @@ static void clear_set(int res, const float* c) {
 static const float* clear_get(int res) { for (LONG i = 0; i < g_nclear; i++) if (g_clear[i].res == res) return g_clear[i].rgba; return NULL; }
 int rg_init(HWND hwnd);
 int rg_present_clear(const float* rgba);
+int rg_rootsig_info(const void* blob, size_t len, uint8_t* kind, uint16_t* val, int maxp, char* out, size_t cap);
 typedef struct { uint32_t slot, nextra; uint64_t a[6]; } RecHdr;
 static ObjInfo* g_obj;             /* MAXOBJ entries, allocated on first use */
 static void* g_dxgidev;
@@ -356,6 +358,7 @@ static void replay_list(int lid) {
     CmdRec* r = (CmdRec*)g_obj[lid].meta;
     int pso = -1, rootsig = -1; uint64_t tables[16] = { 0 }, views[16] = { 0 }, heaps[2] = { 0 }; uint32_t consts[16][64]; uint32_t cmask[16] = { 0 };
     float gvp[6] = { 0, 0, 3840, 2160, 0, 1 }; uint64_t groot0 = 0;
+    int grs = -1; uint64_t gtab[16] = { 0 }, gview[16] = { 0 }; uint32_t gconst[16][64] = { 0 }; uint32_t gib[4] = { 0 }; uint32_t gvb[32][4] = { 0 };   /* graphics root + IA state */
     static volatile LONG logged; static uint64_t seen[4096]; static LONG nseen;
     for (size_t off = 0; off + sizeof(RecHdr) <= r->used;) {
         RecHdr* h = (RecHdr*)(r->buf + off); const uint32_t* ex = (const uint32_t*)(h + 1);
@@ -395,6 +398,22 @@ static void replay_list(int lid) {
         /* graphics state for real-GPU draws */
         if (h->slot == 21 && h->nextra == 6) memcpy(gvp, ex, 24);
         if (h->slot == 44 && h->a[0] == 0) groot0 = h->a[1];                      /* Xbox: SetGraphicsRootShaderResourceView(0, va) */
+        if ((h->slot == 12 || h->slot == 13) && pso > 0 && g_obj[pso].slot == 57) {   /* GTA6_DRAWLOG: main-renderer draw state, first 12 draws */
+            static volatile LONG nlog; static int want = -1; if (want < 0) want = GetEnvironmentVariableA("GTA6_DRAWLOG", NULL, 0) ? 1 : 0;
+            LONG my; PsoMeta* pm = (PsoMeta*)g_obj[pso].meta;
+            if (want && pm && (my = InterlockedIncrement(&nlog)) <= 12) {
+                dlog("DRAWLOG #%ld m%u(%llX %llX %llX %llX %llX) vs %016llX ps %016llX rootsig obj#%d", my, h->slot, h->a[0], h->a[1], h->a[2], h->a[3], h->a[4], pm->vhash, pm->phash, grs);
+                dlog("DRAWLOG   tables %llX %llX %llX %llX  views %llX %llX  consts1 %08X %08X  ib %08X%08X size %X fmt %X",
+                    gtab[0], gtab[1], gtab[2], gtab[3], gview[0], gview[1], gconst[1][0], gconst[1][1], gib[1], gib[0], gib[2], gib[3]);
+                for (int v = 0; v < 4; v++) if (gvb[v][0] || gvb[v][1]) dlog("DRAWLOG   vb%d addr %08X%08X size %X stride %X", v, gvb[v][1], gvb[v][0], gvb[v][2], gvb[v][3]);
+                for (int t = 0; t < 2; t++) {
+                    uint64_t c = gpu2cpu(gtab[t]);
+                    if (gtab[t] && readable(c, 128)) { const uint32_t* q = (const uint32_t*)c;
+                        for (int dsc = 0; dsc < 4; dsc++) dlog("DRAWLOG   table%d[%d] @%llX: %08X %08X %08X %08X | %08X %08X %08X %08X", t, dsc, gtab[t] + dsc * 32,
+                            q[dsc * 8], q[dsc * 8 + 1], q[dsc * 8 + 2], q[dsc * 8 + 3], q[dsc * 8 + 4], q[dsc * 8 + 5], q[dsc * 8 + 6], q[dsc * 8 + 7]); }
+                }
+            }
+        }
         if ((h->slot == 12) && pso > 0) {
             PsoMeta* gm = (PsoMeta*)g_obj[pso].meta;
             /* translated path: the game's RDNA2 shaders, translated offline to DXIL (tools/xlat_all.py), keyed by container hash */
@@ -420,6 +439,13 @@ static void replay_list(int lid) {
         case 33: rootsig = objid(h->a[0]); break;                               /* SetComputeRootSignature */
         case 28: for (uint32_t i = 0; i < h->nextra / 2 && i < 2; i++) heaps[i] = ((const uint64_t*)ex)[i]; break;
         case 35: if (h->a[0] < 16) tables[h->a[0]] = gpu2cpu(h->a[1]); break;   /* SetComputeRootDescriptorTable */
+        case 34: grs = objid(h->a[0]); break;                                    /* SetGraphicsRootSignature */
+        case 36: if (h->a[0] < 16) gtab[h->a[0]] = h->a[1]; break;              /* SetGraphicsRootDescriptorTable (GPU handle, low alias) */
+        case 38: if (h->a[0] < 16 && h->a[2] < 64) gconst[h->a[0]][h->a[2]] = (uint32_t)h->a[1]; break;
+        case 40: if (h->a[0] < 16) for (uint32_t i = 0; i < h->nextra && h->a[3] + i < 64; i++) gconst[h->a[0]][h->a[3] + i] = ex[i]; break;
+        case 42: case 44: case 46: if (h->a[0] < 16) gview[h->a[0]] = h->a[1]; break;   /* Set Graphics Root CBV / SRV / UAV */
+        case 47: if (h->nextra == 4) memcpy(gib, ex, 16); break;
+        case 48: for (uint32_t i = 0; i < h->nextra / 4 && h->a[0] + i < 32; i++) memcpy(gvb[h->a[0] + i], ex + i * 4, 16); break;
         case 41: case 43: case 45: if (h->a[0] < 16) views[h->a[0]] = h->a[1]; break;
         case 37: if (h->a[0] < 16 && h->a[2] < 64) { consts[h->a[0]][h->a[2]] = (uint32_t)h->a[1]; cmask[h->a[0]] |= 1; } break;
         case 39: if (h->a[0] < 16) for (uint32_t i = 0; i < h->nextra && h->a[3] + i < 64; i++) { consts[h->a[0]][h->a[3] + i] = ex[i]; cmask[h->a[0]] |= 1; } break;
@@ -527,6 +553,11 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
             void* o = (slot == 0 && id >= 0) ? g_obj[id].p : (id > 0 && slot == 7) ? g_obj[0].p : newobj(id, slot, g);
             *(void**)arg[i + 1] = o;
             int no = objid((uint64_t)o);
+            if (id == 0 && slot == 16 && no > 0 && readable(arg[1], (size_t)arg[2])) {   /* CreateRootSignature: keep the layout */
+                RootLayout* rl = (RootLayout*)calloc(1, sizeof(RootLayout)); char s[1500];
+                if (rl) { rl->n = rg_rootsig_info((const void*)arg[1], (size_t)arg[2], rl->kind, rl->val, 64, s, sizeof s); g_obj[no].meta = rl;
+                    static volatile LONG nl; if (InterlockedIncrement(&nl) <= 60) dlog("ROOTSIG obj#%d %p: %s", no, o, rl->n >= 0 ? s : "(not a PC root signature blob)"); }
+            }
             /* heaps (slot 28): own memory; placed resources: heap memory + offset (slot 29) or a title-given address (Xbox slot 133) */
             if (id == 0 && slot == 28 && no > 0 && readable(arg[0], 8)) {
                 uint64_t hs = (*(uint64_t*)arg[0] + 0xFFFF) & ~0xFFFFull; if (!hs) hs = 0x10000;
@@ -658,6 +689,39 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
     /* dev slot 57 = Xbox CreateGraphicsPipelineState: +0x08/+0x18 register blocks, +0x28/+0x30 PS code, +0x48/+0x50 VS code (raw RDNA2) */
     if (id == 0 && slot == 57 && readable(arg[0], 0x58)) {
         const uint64_t* q = (const uint64_t*)arg[0];
+        {   /* GTA6_PSO57DUMP: every (pointer, length) block of the description -> logs\pso57\NN.txt, first 40 pipelines */
+            static volatile LONG nd; LONG my;
+            if (GetEnvironmentVariableA("GTA6_PSO57DUMP", NULL, 0) && (my = InterlockedIncrement(&nd)) <= 40 && readable(arg[0], 0x100)) {
+                static char buf[65536]; static SRWLOCK lk = SRWLOCK_INIT; size_t k = 0; char path[MAX_PATH];
+                AcquireSRWLockExclusive(&lk);
+                k += snprintf(buf + k, sizeof buf - k, "desc %llX rootsig obj#%d\r\n", arg[0], objid(q[0]));
+                for (int i = 0; i < 32; i += 4) k += snprintf(buf + k, sizeof buf - k, " +0x%02X: %016llX %016llX %016llX %016llX\r\n", i * 8, q[i], q[i + 1], q[i + 2], q[i + 3]);
+                for (int i = 0; i + 1 < 32 && k < sizeof buf - 4096; i++) {
+                    uint64_t pp = q[i], ln = q[i + 1];
+                    if (ln && ln < 0x800 && readable(pp, (size_t)ln)) {
+                        const uint32_t* w = (const uint32_t*)pp;
+                        uint64_t fh = 1469598103934665603ull; if (i == 5 || i == 9) for (uint64_t b2 = 0; b2 < ln; b2++) { fh ^= ((const uint8_t*)pp)[b2]; fh *= 1099511628211ull; }
+                        k += snprintf(buf + k, sizeof buf - k, "block at +0x%02X -> %llX (%llu bytes)%s", i * 8, pp, ln, (i == 5 || i == 9) ? " [code, first 64 bytes]" : "");
+                        if (i == 5 || i == 9) k += snprintf(buf + k, sizeof buf - k, " hash %016llX.%s", fh, i == 5 ? "psc" : "vsc");
+                        k += snprintf(buf + k, sizeof buf - k, "\r\n");
+                        uint64_t lim = (i == 5 || i == 9) ? 16 : ln / 4;
+                        for (uint64_t o = 0; o < lim && k < sizeof buf - 200; o += 8) {
+                            k += snprintf(buf + k, sizeof buf - k, "   +%03llX:", o * 4);
+                            for (uint64_t jj = o; jj < o + 8 && jj < lim; jj++) k += snprintf(buf + k, sizeof buf - k, " %08X", w[jj]);
+                            k += snprintf(buf + k, sizeof buf - k, "\r\n");
+                        }
+                    }
+                }
+                if (GetEnvironmentVariableA("GTA6_STUB_LOG", path, MAX_PATH)) {
+                    char* sl = strrchr(path, '\\');
+                    if (sl) { snprintf(sl + 1, MAX_PATH - (sl + 1 - path), "pso57"); CreateDirectoryA(path, NULL);
+                        snprintf(sl + 1, MAX_PATH - (sl + 1 - path), "pso57\\%02ld.txt", my);
+                        HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+                        if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, buf, (DWORD)k, &w, NULL); CloseHandle(f); } }
+                }
+                ReleaseSRWLockExclusive(&lk);
+            }
+        }
         int po = writable(arg[2], 8) ? objid(*(uint64_t*)arg[2]) : -1;
         for (int st = 0; st < 2; st++) {
             uint64_t bp = q[5 + st * 4], bl = q[6 + st * 4];
@@ -838,7 +902,9 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
         case 10: {                                               /* Reset(allocator, pso): start a fresh recording */
             CmdRec* r = (CmdRec*)g_obj[id].meta; if (r) r->used = 0; rec = 1; break; }
         case 14: case 25: case 28: case 29: case 31: case 33: case 37: case 41: case 43: case 45: case 9: rec = 1; break;
-        case 39: rec = 1; if ((uint32_t)arg[1] <= 64 && readable(arg[2], (size_t)(uint32_t)arg[1] * 4)) { extra = (uint32_t)arg[1]; src = (const void*)arg[2]; } break;
+        case 39: case 40: rec = 1; if ((uint32_t)arg[1] <= 64 && readable(arg[2], (size_t)(uint32_t)arg[1] * 4)) { extra = (uint32_t)arg[1]; src = (const void*)arg[2]; } break;   /* Set{Compute,Graphics}Root32BitConstants */
+        case 47: rec = 1; if (readable(arg[0], 16)) { extra = 4; src = (const void*)arg[0]; } break;                                  /* IASetIndexBuffer(view) */
+        case 48: rec = 1; if ((uint32_t)arg[1] >= 1 && (uint32_t)arg[1] <= 16 && readable(arg[2], (size_t)(uint32_t)arg[1] * 16)) { extra = (uint32_t)arg[1] * 4; src = (const void*)arg[2]; } break;  /* IASetVertexBuffers(start, n, views) */
         default: if (slot >= 11) { rec = 1;                      /* everything else: arguments only (cheap - no memory checks on game threads) */
                      static int recdata = -1; if (recdata < 0) recdata = GetEnvironmentVariableA("GTA6_REC_DATA", NULL, 0) ? 1 : 0;
                      if (recdata && readable(arg[1], 64)) { extra = 16; src = (const void*)arg[1]; } } break;
