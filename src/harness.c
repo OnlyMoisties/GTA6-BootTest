@@ -159,8 +159,8 @@ int wmain(int argc, wchar_t** argv) {
                 if (h && GetThreadContext(h, &c) && (c.Dr6 & 1)) {
                     ULONG64 v = 0; SIZE_T g; ReadProcessMemory(g_proc, (void*)g_watch, &v, 8, &g);
                     ULONG64 rv = c.Rip - g_base;
-                    /* a pool chunk header is {tag:16 | freeCount:16 | firstFreeOffset:32}; only log values that don't look like one */
-                    int poolcode = ((v & 0xFFFFFFFFull) < 0x4000 && ((v >> 32) & 0xFFFF) < 0x400 && v != 0) || rv == 0x55AA52A;
+                    /* GTA6_WATCH pool-header filter (only for the heap-region watch): skip values that look like pool chunk headers */
+                    int poolcode = !getenv("GTA6_WATCHEXE") && (((v & 0xFFFFFFFFull) < 0x4000 && ((v >> 32) & 0xFFFF) < 0x400 && v != 0) || rv == 0x55AA52A);
                     if (!poolcode && g_nwatch++ < 40) { L("WATCH write #%d at 0x%llX now=0x%llX by rip=%s tid=%lu", g_nwatch, g_watch, v, A(c.Rip), ev.dwThreadId); dump(h, "watch"); }
                     c.Dr6 = 0; SetThreadContext(h, &c);
                     cont = DBG_CONTINUE; break;

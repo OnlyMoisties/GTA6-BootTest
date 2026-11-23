@@ -115,6 +115,8 @@ static int objid(uint64_t p) {
     if (!p || (p & (OBJSIZE - 1)) || (p >> 47) || !g_obj) return -1;
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery((void*)p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT || mbi.RegionSize < OBJCOMMIT) return -1;
+    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return -1;          /* never touch guard pages (thread stacks) */
+    if (mbi.Type != MEM_PRIVATE || mbi.AllocationBase != (void*)p) return -1;   /* probe objects are their own allocations */
     if (*(uint64_t*)(p + 0xFF0) != OBJMAGIC) return -1;
     uint64_t id = *(uint64_t*)(p + 0xFF8);
     return (id < (uint64_t)g_nobj && id < MAXOBJ && g_obj[id].p == (void*)p) ? (int)id : -1;
@@ -237,9 +239,38 @@ static const ResReg* emu_res_lookup(uint64_t base) {
 }
 #include "rdna2emu.h"
 /* Run workgroup (0,0,0) of a dispatch through the interpreter (GTA6_EMU=1), once per shader; log the outcome. */
+/* per-shader execution status for GTA6_EMU=2 (full dispatches) */
+typedef struct { uint64_t hash; int state; LONG runs; char err[200]; } EmuStat;   /* state: 1 ok, 2 failing */
+static EmuStat g_emustat[4096]; static LONG g_nemustat; static SRWLOCK g_emustat_lk = SRWLOCK_INIT;
+static EmuStat* emustat(uint64_t h) {
+    AcquireSRWLockExclusive(&g_emustat_lk);
+    EmuStat* s = NULL; for (LONG i = 0; i < g_nemustat; i++) if (g_emustat[i].hash == h) { s = &g_emustat[i]; break; }
+    if (!s && g_nemustat < 4096) { s = &g_emustat[g_nemustat++]; s->hash = h; }
+    ReleaseSRWLockExclusive(&g_emustat_lk); return s;
+}
+static void emu_full_dispatch(PsoMeta* m, const uint64_t* tables, const RecHdr* h) {
+    if (!m || !m->hasregs || !readable(m->code, (size_t)m->size)) return;
+    EmuStat* st = emustat(m->hash); if (!st || st->state == 2) return;      /* a failing shader is skipped after its first error */
+    const uint32_t* regs = m->regs;
+    uint32_t nuser = (regs[6] >> 1) & 31, tx = regs[3] & 0xFFFF, ty = regs[3] >> 16; if (!tx) tx = 1; if (!ty) ty = 1;
+    uint32_t user[32] = { 0 };
+    for (int i = 0; i < 4; i++) if (tables[i]) emu_alias(tables[i], 16u << 20);
+    if (nuser >= 6) user[5] = (uint32_t)(tables[1] ? tables[1] : tables[0]);
+    uint32_t gxn = (uint32_t)h->a[0], gyn = (uint32_t)h->a[1], gzn = (uint32_t)h->a[2];
+    char err[300] = ""; ULONGLONG t0 = GetTickCount64(); uint64_t groups = 0; int ok = 1;
+    for (uint32_t gz = 0; gz < gzn && ok; gz++) for (uint32_t gy = 0; gy < gyn && ok; gy++) for (uint32_t gx = 0; gx < gxn && ok; gx++) {
+        ok = emu_run_group((const uint8_t*)m->code, (size_t)m->size, user, (int)nuser, gx, gy, gz, tx, ty, 1, err, sizeof err);
+        groups++;
+    }
+    LONG r = InterlockedIncrement(&st->runs);
+    if (!ok) { st->state = 2; snprintf(st->err, sizeof st->err, "%s", err);
+        dlog("EMU2 FAIL %016llX dispatch %ux%ux%u users=%u: %s", m->hash, gxn, gyn, gzn, nuser, err); }
+    else if (r == 1) { st->state = 1; dlog("EMU2 OK   %016llX dispatch %ux%ux%u (%llu groups of %ux%u) in %llu ms", m->hash, gxn, gyn, gzn, groups, tx, ty, GetTickCount64() - t0); }
+}
 static void emu_try_dispatch(PsoMeta* m, const uint64_t* tables, const RecHdr* h) {
     static uint64_t done[1024]; static LONG nd; static volatile LONG runs;
-    if (!m || !GetEnvironmentVariableA("GTA6_EMU", NULL, 0)) return;
+    char mode[8] = ""; if (!m || !GetEnvironmentVariableA("GTA6_EMU", mode, sizeof mode)) return;
+    if (mode[0] == '2') { emu_full_dispatch(m, tables, h); return; }
     for (LONG i = 0; i < nd && i < 1024; i++) if (done[i] == m->hash) return;
     if (nd < 1024) done[nd++] = m->hash;
     if (InterlockedIncrement(&runs) > 64) return;
@@ -274,6 +305,38 @@ static void replay_list(int lid) {
     static volatile LONG logged; static uint64_t seen[4096]; static LONG nseen;
     for (size_t off = 0; off + sizeof(RecHdr) <= r->used;) {
         RecHdr* h = (RecHdr*)(r->buf + off); const uint32_t* ex = (const uint32_t*)(h + 1);
+        if (h->slot == 12 || h->slot == 13) {                    /* tally draws by the method that created their pipeline */
+            static volatile LONG bycreator[160], total; static ULONGLONG lastrep;
+            int cs = (pso > 0) ? g_obj[pso].slot : 0; if (cs < 0 || cs >= 160) cs = 0;
+            InterlockedIncrement(&bycreator[cs]); LONG t = InterlockedIncrement(&total);
+            ULONGLONG now = GetTickCount64();
+            if (now - lastrep > 5000 && t > 100) { lastrep = now; char s[400] = ""; size_t k = 0;
+                for (int i = 0; i < 160; i++) if (bycreator[i]) k += snprintf(s + k, sizeof s - k, " slot%d=%ld", i, bycreator[i]);
+                dlog("DRAWS by pipeline creator (total %ld):%s", t, s); }
+        }
+        if (h->slot == 12 || h->slot == 13) {                    /* first draws: print the full call sequence leading up to them */
+            static volatile LONG drawdump; static int want = -1; if (want < 0) want = GetEnvironmentVariableA("GTA6_DRAWSEQ", NULL, 0) ? 1 : 0;
+            if (want && InterlockedIncrement(&drawdump) <= 2) {
+                dlog("DRAWSEQ list obj#%d, draw #%ld (m%u %llX %llX %llX %llX) pso=obj#%d:", lid, drawdump, h->slot, h->a[0], h->a[1], h->a[2], h->a[3], pso);
+                if (pso > 0) {
+                    PsoMeta* gm = (PsoMeta*)g_obj[pso].meta;
+                    dlog("   PSO obj#%d created by device slot %d, meta=%p", pso, g_obj[pso].slot, gm);
+                    if (gm && (gm->hash >> 56) == 0x67) {
+                        for (int rr = 0; rr < 12; rr++) dlog("   PSODESC+0x%03X: %016llX %016llX", rr * 16, ((uint64_t*)gm->desc)[rr * 2], ((uint64_t*)gm->desc)[rr * 2 + 1]);
+                        const uint8_t* deref = (const uint8_t*)(gm + 1);
+                        for (int i = 0; i < 16; i++) { const uint32_t* q = (const uint32_t*)(deref + i * 0x100); if (!q[0] && !q[1] && !q[2] && !q[3]) continue;
+                            dlog("   ->+0x%02X: %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X", i * 8, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11]); }
+                    }
+                }
+                for (size_t o2 = 0; o2 + sizeof(RecHdr) <= off;) {
+                    RecHdr* q = (RecHdr*)(r->buf + o2); const uint32_t* qx = (const uint32_t*)(q + 1);
+                    char ex2[200] = ""; size_t k2 = 0; for (uint32_t j = 0; j < q->nextra && j < 16 && k2 < 180; j++) k2 += snprintf(ex2 + k2, sizeof ex2 - k2, "%X ", qx[j]);
+                    int qo = objid(q->a[0]);
+                    dlog("   m%u (%llX, %llX, %llX, %llX) %s%s %s", q->slot, q->a[0], q->a[1], q->a[2], q->a[3], qo > 0 ? "[obj] " : "", q->nextra ? "data:" : "", ex2);
+                    o2 += sizeof(RecHdr) + (size_t)q->nextra * 4;
+                }
+            }
+        }
         switch (h->slot) {
         case 25: pso = objid(h->a[0]); break;
         /* Xbox list layout: compute root methods sit 4 slots after the public ones */
@@ -428,18 +491,74 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
     int isqueue = (id > 0 && g_obj[id].iid.Data1 == 0x0EC870A6);  /* ID3D12CommandQueue */
     /* fence value lives inside the fence object at +0x100 so its address can be handed out (Xbox fence slot 12) */
     #define FENCEVAL(i) (*(volatile uint64_t*)((uint8_t*)g_obj[i].p + 0x100))
+    /* SetEventOnCompletion waiters: fire only when the fence actually reaches the value */
+    static struct { int fence; uint64_t value; HANDLE ev; } waiters[4096]; static LONG nwait; static SRWLOCK wlk = SRWLOCK_INIT;
+    #define FENCE_SET(i, val) do { int fi_ = (i); uint64_t v_ = (val); FENCEVAL(fi_) = v_; \
+        AcquireSRWLockExclusive(&wlk); for (LONG k_ = 0; k_ < nwait;) { if (waiters[k_].fence == fi_ && waiters[k_].value <= v_) { SetEvent(waiters[k_].ev); waiters[k_] = waiters[--nwait]; } else k_++; } \
+        ReleaseSRWLockExclusive(&wlk); } while (0)
     if (id == 0 && slot == 36 && !sret) {                        /* CreateFence(initial, flags, riid, ppv): seed value */
         int f = objid(writable(arg[3], 8) ? *(uint64_t*)arg[3] : 0);
         if (f > 0) FENCEVAL(f) = arg[0];
     }
     if (isfence && !sret) {
         if (slot == 8) return FENCEVAL(id);                      /* GetCompletedValue */
-        if (slot == 9) {                                         /* SetEventOnCompletion(value, event): everything completes at once here */
-            if (arg[1]) SetEvent((HANDLE)arg[1]);
+        if (slot == 9) {                                         /* SetEventOnCompletion(value, event) */
+            if (!arg[1]) return 0;
+            if (FENCEVAL(id) >= arg[0] || GetEnvironmentVariableA("GTA6_FENCE_INSTANT", NULL, 0)) { SetEvent((HANDLE)arg[1]); return 0; }
+            AcquireSRWLockExclusive(&wlk);
+            if (FENCEVAL(id) >= arg[0]) SetEvent((HANDLE)arg[1]);
+            else if (nwait < 4096) { waiters[nwait].fence = id; waiters[nwait].value = arg[0]; waiters[nwait].ev = (HANDLE)arg[1]; nwait++; }
+            ReleaseSRWLockExclusive(&wlk);
             return 0;
         }
-        if (slot == 10) { FENCEVAL(id) = arg[0]; return 0; }     /* Signal(value) from the CPU */
+        if (slot == 10) { FENCE_SET(id, arg[0]); return 0; }     /* Signal(value) from the CPU */
         if (slot == 12) return (uint64_t)&FENCEVAL(id);          /* Xbox: address of the completed value, polled by the title */
+    }
+    /* CreatePipelineState(stream desc {size, ptr}) = dev slot 86: walk the D3D12 subobject stream, save VS/PS/CS bytecode */
+    if (id == 0 && slot == 86 && readable(arg[0], 16)) {
+        uint64_t ssize = ((uint64_t*)arg[0])[0], sp = ((uint64_t*)arg[0])[1];
+        static volatile LONG shown;
+        if (ssize && ssize < 0x2000 && readable(sp, (size_t)ssize)) {
+            const uint8_t* s = (const uint8_t*)sp; size_t o = 0; char line[600]; size_t k = 0;
+            static const int psz[] = { 8, 16, 16, 16, 16, 16, 16, 40, 328, 4, 44, 52, 16, 4, 4, 32, 4, 8, 4, 16, 4, 52, 16, 0, 16, 16 };
+            while (o + 8 <= ssize) {
+                uint32_t type = *(const uint32_t*)(s + o); if (type > 25) break;
+                size_t po = (type == 9 || type == 13 || type == 14 || type == 16 || type == 18 || type == 20) ? o + 4 : o + 8;   /* 4-byte payloads */
+                if (type >= 1 && type <= 6) {                    /* shader bytecode {ptr, len} */
+                    uint64_t bp = *(const uint64_t*)(s + po), bl = *(const uint64_t*)(s + po + 8);
+                    k += snprintf(line + k, sizeof line - k, " %s=%llX(%llu)", type == 1 ? "VS" : type == 2 ? "PS" : type == 6 ? "CS" : type == 5 ? "GS" : "HS/DS", bp, bl);
+                    if (bl >= 16 && bl < (8u << 20) && readable(bp, (size_t)bl)) {
+                        uint64_t hh = 1469598103934665603ull; for (uint64_t i = 0; i < bl; i++) { hh ^= ((uint8_t*)bp)[i]; hh *= 1099511628211ull; }
+                        char path[MAX_PATH];
+                        if (GetEnvironmentVariableA("GTA6_STUB_LOG", path, MAX_PATH)) {
+                            char* sl = strrchr(path, '\\'); if (sl) snprintf(sl + 1, MAX_PATH - (sl + 1 - path), "shaders\\%016llX.%s", hh, type == 1 ? "vs" : type == 2 ? "ps" : "xs");
+                            HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
+                            if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, (void*)bp, (DWORD)bl, &w, NULL); CloseHandle(f); }
+                        }
+                        k += snprintf(line + k, sizeof line - k, "[%016llX]", hh);
+                    }
+                } else k += snprintf(line + k, sizeof line - k, " t%u", type);
+                size_t adv = (po - o) + (type < sizeof psz / sizeof psz[0] ? psz[type] : 8);
+                o += (adv + 7) & ~(size_t)7;
+                if (k > 520) break;
+            }
+            if (InterlockedIncrement(&shown) <= 6) dlog("PSOSTREAM size=0x%llX:%s", ssize, line);
+        }
+    }
+    /* graphics/other pipeline creators (55, 57, 62, 86): keep a copy of the description + what its pointers point at */
+    if (id == 0 && (slot == 55 || slot == 57 || slot == 62 || slot == 86)) {
+        uint64_t dp = slot == 55 ? arg[2] : arg[0], ppv = slot == 55 ? arg[4] : slot == 62 ? arg[4] : arg[2];
+        int po = writable(ppv, 8) ? objid(*(uint64_t*)ppv) : -1;
+        if (po > 0 && !g_obj[po].meta && readable(dp, 0x180)) {
+            PsoMeta* m = (PsoMeta*)calloc(1, sizeof(PsoMeta) + 16 * 0x100);
+            if (m) {
+                memcpy(m->desc, (void*)dp, sizeof m->desc);
+                uint8_t* deref = (uint8_t*)(m + 1);
+                for (int i = 0; i < 16; i++) { uint64_t q = ((uint64_t*)m->desc)[i]; if (readable(q, 0x100)) memcpy(deref + i * 0x100, (void*)q, 0x100); }
+                m->hash = 0x6700000000000000ull | (uint64_t)slot;     /* marks "graphics pipeline, created by slot N" */
+                g_obj[po].meta = m;
+            }
+        }
     }
     /* remember shader + desc on the created pipeline object (dev slot 67: ppv is arg[2]) */
     if (id == 0 && slot == 67 && readable(arg[0], 0x38) && writable(arg[2], 8)) {
@@ -493,6 +612,17 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
     }
     if (isqueue && !sret && slot == 32) {                        /* PresentX(planeCount, planes, params) */
         static volatile LONG pc; LONG k = InterlockedIncrement(&pc);
+        {   /* the console paces presents to the display: wait for the next 60 Hz slot (GTA6_NO_VSYNC=1 disables) */
+            static LARGE_INTEGER freq, next; LARGE_INTEGER now;
+            if (!GetEnvironmentVariableA("GTA6_NO_VSYNC", NULL, 0)) {
+                if (!freq.QuadPart) { QueryPerformanceFrequency(&freq); timeBeginPeriod(1); }
+                QueryPerformanceCounter(&now);
+                LONGLONG period = freq.QuadPart / 60;
+                if (next.QuadPart < now.QuadPart - period) next.QuadPart = now.QuadPart;      /* fell behind: resync */
+                while (now.QuadPart < next.QuadPart) { LONGLONG ms = (next.QuadPart - now.QuadPart) * 1000 / freq.QuadPart; Sleep(ms > 1 ? (DWORD)(ms - 1) : 0); QueryPerformanceCounter(&now); }
+                next.QuadPart += period;
+            }
+        }
         /* plane0 +0x10 -> array of back-buffer resources, entry 0 is the one being presented; source rect at params +0x28 */
         if (readable(arg[1], 24)) {
             uint64_t arr = ((uint64_t*)arg[1])[2]; int ro = readable(arr, 8) ? objid(*(uint64_t*)arr) : -1;
@@ -512,7 +642,7 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
         }
     }
     /* ---- descriptor creation: write hardware descriptors into the heap slot ---- */
-    if (id == 0 && !sret && slot >= 17 && slot <= 24) {
+    if (id == 0 && !sret && slot >= 17 && slot <= 24 && !GetEnvironmentVariableA("GTA6_NO_DESC", NULL, 0)) {
         uint64_t dst = 0; const char* what = "";
         switch (slot) {
         case 17:                                                 /* CreateConstantBufferView(desc{gpuVA, size}, handle) */
@@ -552,8 +682,9 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
             CmdRec* r = (CmdRec*)g_obj[id].meta; if (r) r->used = 0; rec = 1; break; }
         case 14: case 25: case 28: case 29: case 31: case 33: case 37: case 41: case 43: case 45: case 9: rec = 1; break;
         case 39: rec = 1; if ((uint32_t)arg[1] <= 64 && readable(arg[2], (size_t)(uint32_t)arg[1] * 4)) { extra = (uint32_t)arg[1]; src = (const void*)arg[2]; } break;
-        default: if (slot >= 60) { rec = 1;                      /* Xbox-specific methods: keep them, plus 16 dwords behind arg[1] */
-                     if (readable(arg[1], 64)) { extra = 16; src = (const void*)arg[1]; } } break;
+        default: if (slot >= 11) { rec = 1;                      /* everything else: arguments only (cheap - no memory checks on game threads) */
+                     static int recdata = -1; if (recdata < 0) recdata = GetEnvironmentVariableA("GTA6_REC_DATA", NULL, 0) ? 1 : 0;
+                     if (recdata && readable(arg[1], 64)) { extra = 16; src = (const void*)arg[1]; } } break;
         case 35: rec = 1; break;                                 /* Xbox: SetComputeRootDescriptorTable(index, gpuHandle) */
         case 28 + 1000: break;
         }
@@ -573,11 +704,21 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
     }
     /* ---- ExecuteCommandLists(n, lists): walk recordings, log dispatches with their compute state ---- */
     if (isqueue && !sret && slot == 35 && readable(arg[1], (size_t)(uint32_t)arg[0] * 8)) {
-        for (uint32_t li = 0; li < (uint32_t)arg[0] && li < 64; li++) replay_list(objid(((uint64_t*)arg[1])[li]));
+        static int noreplay = -1; if (noreplay < 0) noreplay = GetEnvironmentVariableA("GTA6_NO_REPLAY", NULL, 0) ? 1 : 0;
+        static LARGE_INTEGER qf; static LONGLONG spent, lists, recs; static ULONGLONG lastrep; LARGE_INTEGER t0, t1;
+        if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+        QueryPerformanceCounter(&t0);
+        if (!noreplay) for (uint32_t li = 0; li < (uint32_t)arg[0] && li < 64; li++) {
+            int lo = objid(((uint64_t*)arg[1])[li]); replay_list(lo); lists++;
+            if (lo > 0 && g_obj[lo].meta) recs += (LONGLONG)(((CmdRec*)g_obj[lo].meta)->used / sizeof(RecHdr));
+        }
+        QueryPerformanceCounter(&t1); spent += t1.QuadPart - t0.QuadPart;
+        if (GetTickCount64() - lastrep > 5000) { lastrep = GetTickCount64();
+            dlog("REPLAY cost: %.1f ms over the last 5 s, %lld lists, ~%lld records", spent * 1000.0 / qf.QuadPart, lists, recs); spent = lists = recs = 0; }
     }
     if (isqueue && !sret && slot == 16) {                        /* Xbox queue Signal(fence, value): commands "finish" instantly */
         int f = objid(arg[0]);
-        if (f > 0 && g_obj[f].iid.Data1 == 0x0A753DCF) FENCEVAL(f) = arg[1];
+        if (f > 0 && g_obj[f].iid.Data1 == 0x0A753DCF) FENCE_SET(f, arg[1]);
         return 0;
     }
     if (isheap && (slot == 9 || slot == 10)) {                   /* Get CPU/GPU DescriptorHandleForHeapStart */

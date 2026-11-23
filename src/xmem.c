@@ -31,7 +31,14 @@ static LONG CALLBACK lazy_veh(EXCEPTION_POINTERS* ep) {
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
-BOOL WINAPI DllMain(HINSTANCE h, DWORD why, LPVOID r) { if (why == DLL_PROCESS_ATTACH) { fs_install(); AddVectoredExceptionHandler(1, lazy_veh); } return TRUE; }
+BOOL WINAPI DllMain(HINSTANCE h, DWORD why, LPVOID r) {
+    if (why == DLL_PROCESS_ATTACH) {
+        fs_install(); AddVectoredExceptionHandler(1, lazy_veh);
+        char w[32];   /* GTA6_WATCHEXE=<hex offset>: hardware write watchpoint on exe+offset (debugging aid) */
+        if (GetEnvironmentVariableA("GTA6_WATCHEXE", w, sizeof w)) { char msg[80]; snprintf(msg, sizeof msg, "GTA6WATCH 0x%llX", (uint64_t)GetModuleHandleA(NULL) + _strtoui64(w, NULL, 16)); OutputDebugStringA(msg); }
+    }
+    return TRUE;
+}
 static DWORD prot_of(uint64_t a, uint64_t b) {
     uint64_t v[2] = { a, b };
     for (int i = 0; i < 2; i++) { uint64_t p = v[i] & 0xFF; if (v[i] < 0x1000 && (p == 1 || p == 2 || p == 4 || p == 0x10 || p == 0x20 || p == 0x40)) return (DWORD)p; }

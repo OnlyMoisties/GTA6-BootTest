@@ -412,7 +412,6 @@ static void step(Wave* w) {
                 if (im.bpp) img_unpack(&im, px, rgba);            /* keep components not in dmask */
                 for (int c = 0, k = 0; c < 4; c++) if (dmask >> c & 1) rgba[c] = f32(w->v[vdata + k++][l]);
                 img_pack(&im, px, rgba);
-                { static volatile LONG sl; if (InterlockedIncrement(&sl) <= 10) dlog("EMU store fmt=%u (%u,%u,%u) dmask=%X rgba=%.4f %.4f %.4f %.4f", im.fmt, x, y, z, dmask, rgba[0], rgba[1], rgba[2], rgba[3]); }
             } else {
                 if (px) img_unpack(&im, px, rgba);
                 else rgba[3] = 0;                                 /* out of bounds loads return 0 */
