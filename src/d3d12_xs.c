@@ -83,7 +83,8 @@ typedef struct { void* p; int parent, slot, kind; GUID iid; void* aux; void* met
 /* ---- command recording (emulator step 1) ----
    Command lists keep a record buffer: {u32 slot, u32 nextra, u64 a[6]} followed by nextra extra dwords (copied data).
    Pipeline objects keep meta = PsoMeta (shader code, size, hash, copy of the creation desc). */
-typedef struct { uint64_t code, size, hash; uint8_t desc[0x180]; uint32_t regs[7]; int hasregs; const void* vs; const void* ps; size_t vslen, pslen; } PsoMeta;
+typedef struct { uint64_t code, size, hash; uint8_t desc[0x180]; uint32_t regs[7]; int hasregs; const void* vs; const void* ps; size_t vslen, pslen; uint64_t vhash, phash; } PsoMeta;
+void rg_queue_xlat_draw(uint64_t vh, uint64_t ph, const uint32_t* user16, uint64_t base, const void* win, uint32_t winlen, uint32_t verts, uint32_t insts, const float* vp);
 void rg_queue_dxil_draw(const void* vs, size_t vslen, const void* ps, size_t pslen, const void* srv, uint32_t srvlen, uint32_t verts, uint32_t insts, const float* vp);
 typedef struct { uint8_t* buf; size_t used, cap; } CmdRec;
 /* Resources keep meta = ResMeta (their D3D12_RESOURCE_DESC); memory stays in aux. */
@@ -360,6 +361,16 @@ static void replay_list(int lid) {
         if (h->slot == 44 && h->a[0] == 0) groot0 = h->a[1];                      /* Xbox: SetGraphicsRootShaderResourceView(0, va) */
         if ((h->slot == 12) && pso > 0) {
             PsoMeta* gm = (PsoMeta*)g_obj[pso].meta;
+            /* translated path: the game's RDNA2 shaders, translated offline to DXIL (tools/xlat_all.py), keyed by container hash */
+            if (gm && gm->vs && gm->ps && readable(groot0, 256) && GetEnvironmentVariableA("GTA6_XLAT_DIR", NULL, 0)) {
+                if (!gm->vhash) { uint64_t a = 1469598103934665603ull, b = a;
+                    for (size_t i = 0; i < gm->vslen; i++) { a ^= ((const uint8_t*)gm->vs)[i]; a *= 1099511628211ull; }
+                    for (size_t i = 0; i < gm->pslen; i++) { b ^= ((const uint8_t*)gm->ps)[i]; b *= 1099511628211ull; }
+                    gm->vhash = a; gm->phash = b; }
+                uint32_t user[16] = { 0 }; user[8] = (uint32_t)groot0; user[9] = (uint32_t)(groot0 >> 32);   /* VS: s[8:9] = root buffer address */
+                uint32_t len = readable(groot0, 4096) ? 4096 : 256;
+                rg_queue_xlat_draw(gm->vhash, gm->phash, user, groot0, (const void*)groot0, len, (uint32_t)h->a[0], (uint32_t)h->a[1], gvp);
+            }
             /* off by default: the exe's "DXIL" shaders are shells (NOBC) - the PC driver can't compile them */
             static int trydxil = -1; if (trydxil < 0) trydxil = GetEnvironmentVariableA("GTA6_TRY_DXIL", NULL, 0) ? 1 : 0;
             if (trydxil && gm && gm->vs && gm->ps && readable(groot0, 256)) {
