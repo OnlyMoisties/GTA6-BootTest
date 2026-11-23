@@ -360,7 +360,9 @@ static void replay_list(int lid) {
         if (h->slot == 44 && h->a[0] == 0) groot0 = h->a[1];                      /* Xbox: SetGraphicsRootShaderResourceView(0, va) */
         if ((h->slot == 12) && pso > 0) {
             PsoMeta* gm = (PsoMeta*)g_obj[pso].meta;
-            if (gm && gm->vs && gm->ps && readable(groot0, 256)) {
+            /* off by default: the exe's "DXIL" shaders are shells (NOBC) - the PC driver can't compile them */
+            static int trydxil = -1; if (trydxil < 0) trydxil = GetEnvironmentVariableA("GTA6_TRY_DXIL", NULL, 0) ? 1 : 0;
+            if (trydxil && gm && gm->vs && gm->ps && readable(groot0, 256)) {
                 uint32_t len = readable(groot0, 4096) ? 4096 : 256;
                 rg_queue_dxil_draw(gm->vs, gm->vslen, gm->ps, gm->pslen, (const void*)groot0, len, (uint32_t)h->a[0], (uint32_t)h->a[1], gvp);
             }
