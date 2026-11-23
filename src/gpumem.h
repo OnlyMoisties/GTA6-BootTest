@@ -19,4 +19,9 @@ typedef struct {
     uint32_t* volatile dir[65536];
     volatile long chunkgen[65536];            /* bumped when a chunk changes */
     volatile long long gen;                   /* bumped on any change */
+    /* GPU-only aliases below 4 GB (shader-visible descriptor heaps: Xbox shaders hold table pointers as 32 bits,
+       high half 0). Written by d3d12_xs, resolved by realgpu into the page table's 4 GB chunk 0. */
+    volatile long nalias;
+    struct { uint64_t gpu, cpu, size; } alias[256];
 } GpuMem;
+#define GM_LOWGPU_BASE 0x10000000ull          /* first low GPU address handed out for descriptor heaps */

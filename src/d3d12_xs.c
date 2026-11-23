@@ -210,6 +210,38 @@ static int in_exe(uint64_t p) {
     return mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE;
 }
 
+/* ---- low GPU aliases for shader-visible descriptor heaps (see gpumem.h) ---- */
+#include "gpumem.h"
+static GpuMem* gmem(void) {
+    static GpuMem* g; static int tried;
+    if (!tried) { tried = 1; HMODULE x = GetModuleHandleA("xmem.dll"); typedef void* (*StFn)(void);
+        StFn f = x ? (StFn)GetProcAddress(x, "xmem_gpu_state") : NULL; g = f ? (GpuMem*)f() : NULL; }
+    return g;
+}
+static uint64_t g_heaplow[4096];                                  /* obj id -> low GPU base (0 = none) */
+static uint64_t heap_lowgpu(int id) {
+    if (id <= 0 || id >= 4096 || !g_obj[id].aux || !g_obj[id].meta) return 0;
+    if (g_heaplow[id]) return g_heaplow[id];
+    GpuMem* g = gmem(); if (!g) return 0;
+    static SRWLOCK lk = SRWLOCK_INIT; static uint64_t next = GM_LOWGPU_BASE;
+    uint64_t size = *(uint64_t*)g_obj[id].meta, cpu = (uint64_t)g_obj[id].aux;
+    AcquireSRWLockExclusive(&lk);
+    if (!g_heaplow[id] && g->nalias < 256 && next + size < 0xF0000000ull) {
+        uint64_t lo = next | (cpu & 0xFFFF);                      /* keep the offset inside a 64 KB page so pages line up */
+        long n = g->nalias; g->alias[n].gpu = lo; g->alias[n].cpu = cpu; g->alias[n].size = size;
+        InterlockedIncrement(&g->nalias); InterlockedIncrement64(&g->gen);
+        next = (lo + size + 0x1FFFF) & ~0xFFFFull; g_heaplow[id] = lo;
+        dlog("descriptor heap obj#%d: cpu %llX size 0x%llX -> GPU alias %llX", id, cpu, size, lo);
+    }
+    ReleaseSRWLockExclusive(&lk);
+    return g_heaplow[id];
+}
+static uint64_t gpu2cpu(uint64_t a) {                             /* low GPU alias -> CPU address (for our own CPU-side readers) */
+    GpuMem* g = gmem(); if (!g || a >= 0x100000000ull) return a;
+    for (long i = 0; i < g->nalias; i++) if (a >= g->alias[i].gpu && a < g->alias[i].gpu + g->alias[i].size) return g->alias[i].cpu + (a - g->alias[i].gpu);
+    return a;
+}
+
 /* Show the presented back buffer in the game window (~30 Hz) with a status line. The buffer is read as 32-bit
    BGRA rows; on the console it may be tiled/another format, and nothing renders into it yet, so expect black. */
 static void show_frame(void* pixels, uint32_t w, uint32_t h, LONG frame) {
@@ -387,7 +419,7 @@ static void replay_list(int lid) {
         /* Xbox list layout: compute root methods sit 4 slots after the public ones */
         case 33: rootsig = objid(h->a[0]); break;                               /* SetComputeRootSignature */
         case 28: for (uint32_t i = 0; i < h->nextra / 2 && i < 2; i++) heaps[i] = ((const uint64_t*)ex)[i]; break;
-        case 35: if (h->a[0] < 16) tables[h->a[0]] = h->a[1]; break;            /* SetComputeRootDescriptorTable */
+        case 35: if (h->a[0] < 16) tables[h->a[0]] = gpu2cpu(h->a[1]); break;   /* SetComputeRootDescriptorTable */
         case 41: case 43: case 45: if (h->a[0] < 16) views[h->a[0]] = h->a[1]; break;
         case 37: if (h->a[0] < 16 && h->a[2] < 64) { consts[h->a[0]][h->a[2]] = (uint32_t)h->a[1]; cmask[h->a[0]] |= 1; } break;
         case 39: if (h->a[0] < 16) for (uint32_t i = 0; i < h->nextra && h->a[3] + i < 64; i++) { consts[h->a[0]][h->a[3] + i] = ex[i]; cmask[h->a[0]] |= 1; } break;
@@ -522,6 +554,9 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
                 uint64_t useraddr = readable(arg[0], 32) ? ((uint64_t*)arg[0])[2] : 0;
                 g_obj[objid((uint64_t)o)].aux = (useraddr && readable(useraddr, 8)) ? (void*)useraddr
                     : VirtualAlloc(NULL, (size_t)num * 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (((uint32_t*)arg[0])[2] & 1) {                 /* shader-visible: remember the size for the low GPU alias */
+                    uint64_t* hm = (uint64_t*)calloc(1, 16); if (hm) { hm[0] = (uint64_t)num * 32; g_obj[objid((uint64_t)o)].meta = hm; }
+                }
             }
             snprintf(made, sizeof made, " => obj#%d %p iid={%08lX-%04X-%04X}", objid((uint64_t)o), o, g->Data1, g->Data2, g->Data3);
             break;
@@ -848,6 +883,7 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
     }
     if (isheap && (slot == 9 || slot == 10)) {                   /* Get CPU/GPU DescriptorHandleForHeapStart */
         uint64_t h = (uint64_t)g_obj[id].aux;
+        if (slot == 10) { uint64_t lo = heap_lowgpu(id); if (lo) h = lo; }   /* shader-visible heap: low GPU alias */
         if (sret) { *(uint64_t*)rcx = h; ret = rcx; } else ret = h;
     } else if (isres && slot == 11 && !sret) {                   /* GetGPUVirtualAddress: unified memory, GPU VA = CPU address */
         ret = (uint64_t)g_obj[id].aux;

@@ -134,7 +134,7 @@ static void gm_sync(void) {
     if (g_nsecbuf < g_gmem->nsec && !InterlockedCompareExchange(&g_opener, 1, 0)) {
         HANDLE th = CreateThread(NULL, 0, gm_opener, NULL, 0, NULL); if (th) CloseHandle(th); else g_opener = 0;
     }
-    for (int d = 0; d < 65536; d++) {
+    for (int d = 1; d < 65536; d++) {                                     /* chunk 0 (below 4 GB) is built below, with the aliases */
         uint32_t* c = g_gmem->dir[d]; long g = g_gmem->chunkgen[d];
         if (!c || g == g_seen[d]) continue;
         if (!g_slot[d]) { if (g_nslot >= PT_SLOTS) { static int w; if (!w++) rlog("gpumem: page table full"); continue; } g_slot[d] = ++g_nslot; }
@@ -143,40 +143,55 @@ static void gm_sync(void) {
         else for (int k = 0; k < 65536; k++) { uint32_t e = c[k]; dst[k] = (e && (e >> 24) - 1 < vis) ? e : 0; }   /* hide pages of sections not opened yet */
         g_ptabmap[d] = (uint32_t)g_slot[d]; g_seen[d] = g;
     }
+    /* chunk 0: low GPU aliases of descriptor heaps -> the pages backing their CPU memory (rebuilt every frame: cheap) */
+    if (g_gmem->nalias || g_gmem->dir[0]) {
+        if (!g_slot[0] && g_nslot < PT_SLOTS) g_slot[0] = ++g_nslot;
+        if (g_slot[0]) {
+            uint32_t* dst = g_ptabmap + 65536 + (size_t)(g_slot[0] - 1) * 65536; uint32_t vis = (uint32_t)g_secvis;
+            static uint32_t tmp[65536]; if (g_gmem->dir[0]) memcpy(tmp, g_gmem->dir[0], sizeof tmp); else memset(tmp, 0, sizeof tmp);
+            static int missing_logged;
+            for (long i = 0; i < g_gmem->nalias; i++) {
+                uint64_t gpu = g_gmem->alias[i].gpu & ~0xFFFFull, cpu = g_gmem->alias[i].cpu & ~0xFFFFull, end = g_gmem->alias[i].gpu + g_gmem->alias[i].size;
+                for (; gpu < end; gpu += GM_PAGE, cpu += GM_PAGE) {
+                    uint32_t* c = g_gmem->dir[(cpu >> 32) & 0xFFFF]; uint32_t e = c ? c[(cpu >> 16) & 0xFFFF] : 0;
+                    if (!e && missing_logged < 4) { missing_logged++; rlog("gpumem: descriptor heap page cpu %llX is not pool memory (GPU sees zeros there)", cpu); }
+                    tmp[(gpu >> 16) & 0xFFFF] = e;
+                }
+            }
+            for (int k = 0; k < 65536; k++) { uint32_t e = tmp[k]; dst[k] = (e && (e >> 24) - 1 < vis) ? e : 0; }
+            g_ptabmap[0] = (uint32_t)g_slot[0];
+        }
+    }
 }
-/* one-time check: a compute shader reads 16 mapped game addresses through the page table; compare with what the CPU sees there */
-static void gm_selftest(void) {
-    static int done; if (done || !g_gmem || !g_gmem->nsec || g_secvis < g_gmem->nsec) return; done = 1;
-    uint64_t addr[16]; int n = 0;
-    for (int d = 0; d < 65536 && n < 16; d++) { uint32_t* c = g_gmem->dir[d]; if (!c) continue;
-        for (int i = 0; i < 65536 && n < 16; i += 7) if (c[i] && (c[i] >> 24) - 1 < (uint32_t)g_secvis) {
-            uint64_t base = ((uint64_t)d << 32) | ((uint64_t)i << 16);
-            for (uint32_t o = 0; o < 0x10000; o += 0x40) if (*(volatile uint32_t*)(base + o)) { addr[n++] = base + o; break; } } }
-    if (n < 16) { rlog("gpumem self-test: only %d mapped pages found, skipped", n); return; }
-    char cso[MAX_PATH]; if (!GetEnvironmentVariableA("GTA6_GMTEST_CSO", cso, MAX_PATH)) { rlog("gpumem self-test: GTA6_GMTEST_CSO not set, skipped"); return; }
-    HANDLE f = CreateFileA(cso, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL); if (f == INVALID_HANDLE_VALUE) { rlog("gpumem self-test: %s missing", cso); return; }
-    DWORD sz = GetFileSize(f, NULL), rdn = 0; void* code = malloc(sz); ReadFile(f, code, sz, &rdn, NULL); CloseHandle(f);
-    D3D12_ROOT_PARAMETER1 rp[3] = { 0 };
-    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[0].Constants.Num32BitValues = 32;
-    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-    D3D12_VERSIONED_ROOT_SIGNATURE_DESC vd = { D3D_ROOT_SIGNATURE_VERSION_1_1 };
-    vd.Desc_1_1.NumParameters = 3; vd.Desc_1_1.pParameters = rp; vd.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
-    ID3DBlob *blob = NULL, *err = NULL; ID3D12RootSignature* rs = NULL; ID3D12PipelineState* pso = NULL;
-    if (FAILED(D3D12SerializeVersionedRootSignature(&vd, &blob, &err)) || FAILED(ID3D12Device_CreateRootSignature(g_dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void**)&rs))) { rlog("gpumem self-test: root signature failed"); free(code); return; }
-    D3D12_COMPUTE_PIPELINE_STATE_DESC cd = { rs, { code, sz } };
-    HRESULT hr = ID3D12Device_CreateComputePipelineState(g_dev, &cd, &IID_ID3D12PipelineState, (void**)&pso); free(code);
-    if (FAILED(hr)) { rlog("gpumem self-test: pipeline failed 0x%08lX", hr); return; }
-    D3D12_HEAP_PROPERTIES dh = { D3D12_HEAP_TYPE_DEFAULT }, rbh = { D3D12_HEAP_TYPE_READBACK };
-    D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
-    ID3D12Resource *ob = NULL, *rb = NULL;
-    ID3D12Device_CreateCommittedResource(g_dev, &dh, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void**)&ob);
-    rd.Flags = D3D12_RESOURCE_FLAG_NONE;
-    ID3D12Device_CreateCommittedResource(g_dev, &rbh, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&rb);
-    if (!ob || !rb) { rlog("gpumem self-test: buffers failed"); return; }
-    uint32_t cpu[16]; for (int i = 0; i < 16; i++) cpu[i] = *(volatile uint32_t*)addr[i];    /* what the CPU sees (pages are mapped) */
+/* GPU read of 16 addresses through the page table (tools/gmtest.hlsl, path in GTA6_GMTEST_CSO); 1 = ok */
+static int gm_gpuread(const uint64_t addr[16], uint32_t out[16]) {
+    static ID3D12RootSignature* rs; static ID3D12PipelineState* pso; static ID3D12Resource *ob, *rb; static int failed;
+    if (failed) return 0;
+    if (!pso) {
+        char cso[MAX_PATH]; if (!GetEnvironmentVariableA("GTA6_GMTEST_CSO", cso, MAX_PATH)) { failed = 1; rlog("gpumem self-test: GTA6_GMTEST_CSO not set, skipped"); return 0; }
+        HANDLE f = CreateFileA(cso, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL); if (f == INVALID_HANDLE_VALUE) { failed = 1; rlog("gpumem self-test: %s missing", cso); return 0; }
+        DWORD sz = GetFileSize(f, NULL), rdn = 0; void* code = malloc(sz); ReadFile(f, code, sz, &rdn, NULL); CloseHandle(f);
+        D3D12_ROOT_PARAMETER1 rp[3] = { 0 };
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[0].Constants.Num32BitValues = 32;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC vd = { D3D_ROOT_SIGNATURE_VERSION_1_1 };
+        vd.Desc_1_1.NumParameters = 3; vd.Desc_1_1.pParameters = rp; vd.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+        ID3DBlob *blob = NULL, *err = NULL;
+        if (FAILED(D3D12SerializeVersionedRootSignature(&vd, &blob, &err)) || FAILED(ID3D12Device_CreateRootSignature(g_dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void**)&rs))) { failed = 1; rlog("gpumem self-test: root signature failed"); free(code); return 0; }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cd = { rs, { code, sz } };
+        HRESULT hr = ID3D12Device_CreateComputePipelineState(g_dev, &cd, &IID_ID3D12PipelineState, (void**)&pso); free(code);
+        if (FAILED(hr)) { failed = 1; rlog("gpumem self-test: pipeline failed 0x%08lX", hr); return 0; }
+        D3D12_HEAP_PROPERTIES dh = { D3D12_HEAP_TYPE_DEFAULT }, rbh = { D3D12_HEAP_TYPE_READBACK };
+        D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+        ID3D12Device_CreateCommittedResource(g_dev, &dh, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void**)&ob);
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        ID3D12Device_CreateCommittedResource(g_dev, &rbh, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&rb);
+        if (!ob || !rb) { failed = 1; rlog("gpumem self-test: buffers failed"); return 0; }
+    }
     ID3D12CommandAllocator* al = NULL; ID3D12GraphicsCommandList* cl = NULL;
     ID3D12Device_CreateCommandAllocator(g_dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&al);
     ID3D12Device_CreateCommandList(g_dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, pso, &IID_ID3D12GraphicsCommandList, (void**)&cl);
+    if (!cl) return 0;
     ID3D12GraphicsCommandList_SetDescriptorHeaps(cl, 1, &g_srvheap);
     ID3D12GraphicsCommandList_SetComputeRootSignature(cl, rs);
     uint32_t c32[32]; for (int i = 0; i < 16; i++) { c32[2 * i] = (uint32_t)addr[i]; c32[2 * i + 1] = (uint32_t)(addr[i] >> 32); }
@@ -187,14 +202,46 @@ static void gm_selftest(void) {
     D3D12_RESOURCE_BARRIER b = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION }; b.Transition.pResource = ob; b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     ID3D12GraphicsCommandList_ResourceBarrier(cl, 1, &b);
     ID3D12GraphicsCommandList_CopyBufferRegion(cl, rb, 0, ob, 0, 64);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE; b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    ID3D12GraphicsCommandList_ResourceBarrier(cl, 1, &b);
     ID3D12GraphicsCommandList_Close(cl);
     ID3D12CommandQueue_ExecuteCommandLists(g_q, 1, (ID3D12CommandList**)&cl);
     UINT64 v = g_fencenext++; ID3D12CommandQueue_Signal(g_q, g_fence, v); ID3D12Fence_SetEventOnCompletion(g_fence, v, g_fev); WaitForSingleObject(g_fev, 3000);
-    uint32_t* m = NULL; D3D12_RANGE r = { 0, 64 }; int bad = 0;
-    if (SUCCEEDED(ID3D12Resource_Map(rb, 0, &r, (void**)&m)) && m) {
-        for (int i = 0; i < 16; i++) { if (m[i] != cpu[i]) bad++; if (i < 4 || m[i] != cpu[i]) rlog("gpumem self-test: va %llX  cpu %08X  gpu %08X", addr[i], cpu[i], m[i]); }
-        rlog("gpumem self-test: %s (%d of 16 differ; game memory can change between the CPU read and the GPU read)", bad ? "MISMATCH" : "OK, GPU reads the game's memory in place", bad);
-    } else rlog("gpumem self-test: readback failed, device state 0x%08lX", ID3D12Device_GetDeviceRemovedReason(g_dev));
+    ID3D12GraphicsCommandList_Release(cl); ID3D12CommandAllocator_Release(al);
+    uint32_t* m = NULL; D3D12_RANGE r = { 0, 64 }; int ok = 0;
+    if (SUCCEEDED(ID3D12Resource_Map(rb, 0, &r, (void**)&m)) && m) { memcpy(out, m, 64); D3D12_RANGE z = { 0, 0 }; ID3D12Resource_Unmap(rb, 0, &z); ok = 1; }
+    else rlog("gpumem self-test: readback failed, device state 0x%08lX", ID3D12Device_GetDeviceRemovedReason(g_dev));
+    return ok;
+}
+static void gm_report(const char* what, const uint64_t addr[16], const uint64_t cpuaddr[16]) {
+    uint32_t cpu[16], gpu[16]; int bad = 0;
+    for (int i = 0; i < 16; i++) cpu[i] = *(volatile uint32_t*)cpuaddr[i];
+    if (!gm_gpuread(addr, gpu)) return;
+    for (int i = 0; i < 16; i++) { if (gpu[i] != cpu[i]) bad++; if (i < 3 || gpu[i] != cpu[i]) rlog("%s: gpu addr %llX (cpu %llX)  cpu %08X  gpu %08X", what, addr[i], cpuaddr[i], cpu[i], gpu[i]); }
+    rlog("%s: %s (%d of 16 differ; memory can change between the CPU and GPU reads)", what, bad ? "MISMATCH" : "OK", bad);
+}
+/* one-time checks: 16 non-zero words of pool memory, then 16 of a descriptor heap through its low GPU alias */
+static void gm_selftest(void) {
+    static int done, done2, tries2;
+    if (!g_gmem || !g_gmem->nsec || g_secvis < g_gmem->nsec) return;
+    if (!done) {
+        done = 1; uint64_t addr[16]; int n = 0;
+        for (int d = 1; d < 65536 && n < 16; d++) { uint32_t* c = g_gmem->dir[d]; if (!c) continue;
+            for (int i = 0; i < 65536 && n < 16; i += 7) if (c[i] && (c[i] >> 24) - 1 < (uint32_t)g_secvis) {
+                uint64_t base = ((uint64_t)d << 32) | ((uint64_t)i << 16);
+                for (uint32_t o = 0; o < 0x10000; o += 0x40) if (*(volatile uint32_t*)(base + o)) { addr[n++] = base + o; break; } } }
+        if (n == 16) gm_report("gpumem self-test (pool)", addr, addr); else rlog("gpumem self-test: only %d mapped pages found, skipped", n);
+    }
+    if (!done2 && g_gmem->nalias && (++tries2 % 60) == 0) {          /* heaps fill up over time: retry about once a second */
+        uint64_t gpu[16], cpu[16]; int n = 0;
+        uint64_t g0 = g_gmem->alias[0].gpu, c0 = g_gmem->alias[0].cpu, sz = g_gmem->alias[0].size;
+        for (uint64_t o = 0; o + 4 <= sz && n < 16; o += 0x1000 + 4 * (uint64_t)n) {
+            uint32_t* ce = g_gmem->dir[((c0 + o) >> 32) & 0xFFFF]; if (!ce || !ce[((c0 + o) >> 16) & 0xFFFF]) continue;
+            if (*(volatile uint32_t*)(c0 + o)) { gpu[n] = g0 + o; cpu[n] = c0 + o; n++; }
+        }
+        if (n == 16) { done2 = 1; gm_report("gpumem self-test (descriptor heap via low GPU alias)", gpu, cpu); }
+        else if (tries2 >= 60 * 60) { done2 = 1; rlog("gpumem alias test: heap 0 has only %d non-zero pool words after 60 s", n); }
+    }
 }
 
 /* ---- DXIL draws: the game's own portable shaders run on the real GPU ----
