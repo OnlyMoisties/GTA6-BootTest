@@ -24,6 +24,8 @@ def load_spec(path):
         name = e.findtext("EncodingName")
         if name in LITERAL_VARIANTS:                      # their identifiers (low dword) also identify the base encoding
             variant_ids[LITERAL_VARIANTS[name]] |= {int(x.text, 2) & 0xFFFFFFFF for x in e.find("EncodingIdentifiers")}
+        if name in ("VOP3_SDST_ENC", "VOP3_SDST_ENC_INST_LITERAL"):
+            variant_ids["ENC_VOP3"] |= {int(x.text, 2) & 0xFFFFFFFF for x in e.find("EncodingIdentifiers")}
         if name not in BASE_ENCODINGS: continue
         bits = int(e.findtext("BitCount"))
         mask = int(e.find("EncodingIdentifierMask").text, 2)
@@ -45,6 +47,13 @@ def load_spec(path):
             elif en in LITERAL_VARIANTS: litonly.append((LITERAL_VARIANTS[en], opc, nm, operands))
     for base, opc, nm, operands in litonly:
         if opc not in ops[base]: ops[base][opc] = (nm, operands, True)
+    # VOP3 forms with a scalar carry/condition destination (VOP3b) live in their own encodings: same size, no literal
+    for i in isa.find("Instructions"):
+        nm = i.findtext("InstructionName")
+        for ie in i.find("InstructionEncodings"):
+            if ie.findtext("EncodingName") in ("VOP3_SDST_ENC",):
+                opc = int(ie.findtext("Opcode"))
+                if opc not in ops["ENC_VOP3"]: ops["ENC_VOP3"][opc] = (nm, [o.findtext("FieldName") for o in ie.find("Operands")] if ie.find("Operands") is not None else [], False)
     for base, ids in variant_ids.items():
         m = encs[base]["mask"] & 0xFFFFFFFF
         encs[base]["ids"] = set(encs[base]["ids"]) | {i & m for i in ids}

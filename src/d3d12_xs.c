@@ -593,6 +593,67 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
             }
         }
     }
+    /* find shader code referenced by a slot-57 description: scan its blocks for pointers to RDNA2 code (v_nop header 0xD580xxxx) */
+    if (id == 0 && slot == 57 && readable(arg[0], 0x80)) {
+        static volatile LONG scanned; LONG my = InterlockedIncrement(&scanned);
+        if (my <= 3) {
+            const uint64_t* q = (const uint64_t*)arg[0];
+            for (int pi = 0; pi < 15; pi++) {                       /* every qword of the desc, and every qword/dword inside what it points to */
+                uint64_t blk = q[pi]; size_t bsz = 0x400;
+                uint64_t cands[2] = { blk, 0 };
+                for (int c = 0; c < 1; c++) if (readable(cands[c], 8) && (*(const uint32_t*)cands[c] & 0xFFFF0000u) == 0xD5800000u)
+                    dlog("SCAN57#%ld desc+0x%02X is a CODE pointer %llX", my, pi * 8, cands[c]);
+                if (!readable(blk, 64)) continue;
+                if (!readable(blk, bsz)) bsz = 64;
+                for (size_t o = 0; o + 8 <= bsz; o += 4) {
+                    uint64_t v64 = *(const uint64_t*)(blk + o); uint32_t v32 = *(const uint32_t*)(blk + o);
+                    uint64_t tries[3] = { v64, (uint64_t)v32 << 8, ((uint64_t)v32 << 8) | ((uint64_t)(*(const uint32_t*)(blk + o + 4) & 0xFF) << 40) };
+                    for (int t = 0; t < 3; t++) if (tries[t] > 0x10000 && !(tries[t] >> 47) && readable(tries[t], 16) && (*(const uint32_t*)tries[t] & 0xFFFF0000u) == 0xD5800000u)
+                        dlog("SCAN57#%ld desc+0x%02X -> block+0x%zX (%s) = CODE at %llX: %08X %08X %08X", my, pi * 8, o, t == 0 ? "ptr64" : t == 1 ? "lo>>8" : "lo/hi>>8",
+                            tries[t], ((const uint32_t*)tries[t])[0], ((const uint32_t*)tries[t])[1], ((const uint32_t*)tries[t])[2]);
+                }
+            }
+            dlog("SCAN57#%ld done", my);
+        }
+    }
+    /* dev slot 57 = Xbox CreateGraphicsPipelineState: +0x08/+0x18 register blocks, +0x28/+0x30 PS code, +0x48/+0x50 VS code (raw RDNA2) */
+    if (id == 0 && slot == 57 && readable(arg[0], 0x58)) {
+        const uint64_t* q = (const uint64_t*)arg[0];
+        int po = writable(arg[2], 8) ? objid(*(uint64_t*)arg[2]) : -1;
+        for (int st = 0; st < 2; st++) {
+            uint64_t bp = q[5 + st * 4], bl = q[6 + st * 4];
+            if (!bl || bl > (4u << 20) || !readable(bp, (size_t)bl)) continue;
+            uint64_t hh = 1469598103934665603ull; for (uint64_t i = 0; i < bl; i++) { hh ^= ((uint8_t*)bp)[i]; hh *= 1099511628211ull; }
+            static uint64_t seen57[16384]; static LONG n57; static SRWLOCK lk57 = SRWLOCK_INIT; int isnew = 1;
+            AcquireSRWLockExclusive(&lk57);
+            for (LONG i = 0; i < n57; i++) if (seen57[i] == hh) { isnew = 0; break; }
+            if (isnew && n57 < 16384) seen57[n57++] = hh;
+            ReleaseSRWLockExclusive(&lk57);
+            if (isnew) {
+                char path[MAX_PATH];
+                if (GetEnvironmentVariableA("GTA6_STUB_LOG", path, MAX_PATH)) {
+                    char* sl = strrchr(path, '\\'); if (sl) snprintf(sl + 1, MAX_PATH - (sl + 1 - path), "shaders\\%016llX.%s", hh, st ? "vsc" : "psc");
+                    HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
+                    if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, (void*)bp, (DWORD)bl, &w, NULL); CloseHandle(f); }
+                }
+                static volatile LONG shown57; LONG my = InterlockedIncrement(&shown57);
+                if (my <= 6) { const uint32_t* w = (const uint32_t*)bp;
+                    dlog("PSO57 %s %016llX (%llu bytes): %08X %08X %08X %08X %08X %08X %08X %08X", st ? "VS" : "PS", hh, bl, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                    for (int k = 0; k < 8; k++) {                  /* any dword that, as address>>8, points at readable code? */
+                        uint64_t a = (uint64_t)w[k] << 8, a2 = a | ((uint64_t)(w[k + 1] & 0xFF) << 40);
+                        uint64_t cand[2] = { a, a2 };
+                        for (int c = 0; c < 2; c++) if (readable(cand[c], 64)) { const uint32_t* cw = (const uint32_t*)cand[c];
+                            dlog("PSO57   dword%d as PGM address 0x%llX -> %08X %08X %08X %08X %08X %08X %08X %08X", k, cand[c], cw[0], cw[1], cw[2], cw[3], cw[4], cw[5], cw[6], cw[7]); }
+                    }
+                }
+            }
+            if (po > 0) {                                        /* keep them on the pipeline object for translated draws */
+                PsoMeta* m = (PsoMeta*)g_obj[po].meta;
+                if (!m) { m = (PsoMeta*)calloc(1, sizeof(PsoMeta) + 16 * 0x100); g_obj[po].meta = m; if (m) m->hash = 0x6700000000000000ull | 57; }
+                if (m) { if (!st) { m->ps = (const void*)bp; m->pslen = (size_t)bl; m->phash = hh; } else { m->vs = (const void*)bp; m->vslen = (size_t)bl; m->vhash = hh; } }
+            }
+        }
+    }
     /* graphics/other pipeline creators (55, 57, 62, 86): keep a copy of the description + what its pointers point at */
     if (id == 0 && (slot == 55 || slot == 57 || slot == 62 || slot == 86)) {
         uint64_t dp = slot == 55 ? arg[2] : arg[0], ppv = slot == 55 ? arg[4] : slot == 62 ? arg[4] : arg[2];
