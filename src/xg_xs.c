@@ -19,9 +19,13 @@ static void xlog(const char* fmt, ...) {
 static int readable(uint64_t p, size_t n) {
     MEMORY_BASIC_INFORMATION mbi;
     if (p < 0x10000 || (p >> 47)) return 0;
-    if (!VirtualQuery((void*)p, &mbi, sizeof mbi)) return 0;
-    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
-    return (uint64_t)mbi.BaseAddress + mbi.RegionSize >= p + n;
+    uint64_t q = p, end = p + (n ? n : 1);
+    while (q < end) {          /* walk regions: GPU pool memory is one 64 KB view per page */
+        if (!VirtualQuery((void*)q, &mbi, sizeof mbi)) return 0;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
+        q = (uint64_t)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return 1;
 }
 static const char* hx(uint64_t v, int bytes) {
     static __declspec(thread) char s[6][260]; static __declspec(thread) int k; char* o = s[k++ % 6]; o[0] = 0;

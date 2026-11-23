@@ -1,6 +1,6 @@
 # Translate every captured Xbox VS/PS shell (logs/shaders/*.vs|*.ps) to HLSL and compile with dxc.
 # Output: logs/xlat/<hash>.<vs|ps>.hlsl and .cso ; prints a summary of what failed and why.
-# usage: xlat_all.py <spec.xml> <shaders dir> <out dir> <dxc.exe>
+# usage: xlat_all.py <spec.xml> <shaders dir> <out dir> <dxc.exe> [limit]   (env XLAT_EXT=vs,ps limits file types, XLAT_ONLY=hash,hash limits shaders)
 import sys, os, subprocess, collections
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rdna2dis, xbox_shader, rdna2hlsl
@@ -14,6 +14,8 @@ done = 0
 for fn in sorted(os.listdir(src)):
     ext = fn.rsplit(".", 1)[-1]
     if ext not in ("vs", "ps", "vsc", "psc"): continue
+    if os.environ.get("XLAT_EXT") and ext not in os.environ["XLAT_EXT"].split(","): continue
+    if os.environ.get("XLAT_ONLY") and fn.rsplit(".", 1)[0] not in os.environ["XLAT_ONLY"].split(","): continue
     stage = ext[:2]
     h = fn.rsplit(".", 1)[0]
     if done >= limit: break
@@ -23,7 +25,8 @@ for fn in sorted(os.listdir(src)):
         e = raw.find(b"\x00\x00\x81\xbf"); code = raw[:e + 4] if e >= 0 else raw
         stage = rdna2hlsl.detect_stage(spec, code)
     else:
-        f = xbox_shader.fssm_from_container(raw)
+        try: f = xbox_shader.fssm_from_container(raw)
+        except Exception: f = None
         if f is None: fails["no FSSM payload"] += 1; continue
         r = xbox_shader.code_range(spec, f)
         if not r: fails["code not found"] += 1; continue

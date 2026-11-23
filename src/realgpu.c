@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include "gpumem.h"
 
 #define NBUF 3
 static ID3D12Device* g_dev;
@@ -73,6 +74,122 @@ int rg_init(HWND hwnd) {
     rlog("real D3D12 device + %ux%u swap chain on window %p", sd.Width, sd.Height, hwnd);
     g_state = 1;
     return 1;
+}
+
+/* ---- GPU memory pool (gpumem.h): the game's physical memory, read by the GPU in place ----
+   Each 2 GB section of xmem's pool is opened as a heap with one raw buffer + SRV at descriptor index = section.
+   The page table (dir + 64K-entry chunks) lives in an upload buffer, refreshed from xmem's table every frame. */
+#define PT_SLOTS 64
+static GpuMem* g_gmem; static int g_gmtried;
+static ID3D12DescriptorHeap* g_srvheap; static UINT g_srvinc;
+static ID3D12Resource* g_secbuf[GM_MAXSEC]; static int g_nsecbuf;
+static ID3D12Resource* g_ptab; static uint32_t* g_ptabmap;
+static int g_slot[65536]; static int g_nslot; static long g_seen[65536];
+static volatile LONG g_secvis;           /* sections whose heap + SRV exist (published by the opener thread) */
+static volatile LONG g_opener;
+/* Opening a 2 GB section as a heap takes ~0.3 s; doing it inside PresentX stalls the game's frame and exposes a
+   submit/completion race in the title (exe+0x24821FE), so sections are opened on a worker thread. */
+static DWORD WINAPI gm_opener(LPVOID unused) {
+    (void)unused;
+    while (g_gmem && g_nsecbuf < g_gmem->nsec) {
+        int s = g_nsecbuf; ID3D12Device3* d3 = NULL; ID3D12Heap* heap = NULL;
+        if (FAILED(ID3D12Device_QueryInterface(g_dev, &IID_ID3D12Device3, (void**)&d3))) break;
+        HRESULT hr = ID3D12Device3_OpenExistingHeapFromFileMapping(d3, (HANDLE)g_gmem->sec[s], &IID_ID3D12Heap, (void**)&heap);
+        ID3D12Device3_Release(d3);
+        if (FAILED(hr)) { rlog("gpumem: OpenExistingHeapFromFileMapping(section %d) failed 0x%08lX", s, hr); break; }
+        D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, (UINT64)GM_SECPAGES * GM_PAGE, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER };
+        hr = ID3D12Device_CreatePlacedResource(g_dev, heap, 0, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void**)&g_secbuf[s]);
+        if (FAILED(hr)) { rlog("gpumem: section %d buffer failed 0x%08lX", s, hr); break; }
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv = { DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING };
+        sv.Buffer.NumElements = (UINT)(rd.Width / 4); sv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        D3D12_CPU_DESCRIPTOR_HANDLE h; ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(g_srvheap, &h); h.ptr += (SIZE_T)s * g_srvinc;
+        ID3D12Device_CreateShaderResourceView(g_dev, g_secbuf[s], &sv, h);
+        g_nsecbuf++; InterlockedExchange(&g_secvis, g_nsecbuf);
+        for (int d = 0; d < 65536; d++) g_seen[d] = -1;           /* republish chunks: entries of this section become visible */
+        rlog("gpumem: section %d (2 GB) visible to the GPU", s);
+    }
+    InterlockedExchange(&g_opener, 0);
+    return 0;
+}
+static void gm_sync(void) {
+    if (!g_gmtried) {
+        g_gmtried = 1;
+        HMODULE x = GetModuleHandleA("xmem.dll"); typedef void* (*StFn)(void);
+        StFn f = x ? (StFn)GetProcAddress(x, "xmem_gpu_state") : NULL; g_gmem = f ? (GpuMem*)f() : NULL;
+        D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1024, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+        if (FAILED(ID3D12Device_CreateDescriptorHeap(g_dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&g_srvheap))) { rlog("gpumem: descriptor heap failed"); return; }
+        g_srvinc = ID3D12Device_GetDescriptorHandleIncrementSize(g_dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_UPLOAD };
+        D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, (65536ull + PT_SLOTS * 65536ull) * 4, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+        if (FAILED(ID3D12Device_CreateCommittedResource(g_dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g_ptab))) { rlog("gpumem: page table buffer failed"); return; }
+        ID3D12Resource_Map(g_ptab, 0, NULL, (void**)&g_ptabmap); memset(g_ptabmap, 0, (size_t)rd.Width);
+        rlog("gpumem: %s", g_gmem ? "pool found in xmem, GPU reads game memory in place" : "no pool (set GTA6_GPUMEM=1): translated shaders read zeros");
+    }
+    if (!g_gmem || !g_ptabmap) return;
+    if (g_nsecbuf < g_gmem->nsec && !InterlockedCompareExchange(&g_opener, 1, 0)) {
+        HANDLE th = CreateThread(NULL, 0, gm_opener, NULL, 0, NULL); if (th) CloseHandle(th); else g_opener = 0;
+    }
+    for (int d = 0; d < 65536; d++) {
+        uint32_t* c = g_gmem->dir[d]; long g = g_gmem->chunkgen[d];
+        if (!c || g == g_seen[d]) continue;
+        if (!g_slot[d]) { if (g_nslot >= PT_SLOTS) { static int w; if (!w++) rlog("gpumem: page table full"); continue; } g_slot[d] = ++g_nslot; }
+        uint32_t* dst = g_ptabmap + 65536 + (size_t)(g_slot[d] - 1) * 65536; uint32_t vis = (uint32_t)g_secvis;
+        if (vis >= (uint32_t)g_gmem->nsec) memcpy(dst, c, 65536 * 4);
+        else for (int k = 0; k < 65536; k++) { uint32_t e = c[k]; dst[k] = (e && (e >> 24) - 1 < vis) ? e : 0; }   /* hide pages of sections not opened yet */
+        g_ptabmap[d] = (uint32_t)g_slot[d]; g_seen[d] = g;
+    }
+}
+/* one-time check: a compute shader reads 16 mapped game addresses through the page table; compare with what the CPU sees there */
+static void gm_selftest(void) {
+    static int done; if (done || !g_gmem || !g_gmem->nsec || g_secvis < g_gmem->nsec) return; done = 1;
+    uint64_t addr[16]; int n = 0;
+    for (int d = 0; d < 65536 && n < 16; d++) { uint32_t* c = g_gmem->dir[d]; if (!c) continue;
+        for (int i = 0; i < 65536 && n < 16; i += 7) if (c[i] && (c[i] >> 24) - 1 < (uint32_t)g_secvis) {
+            uint64_t base = ((uint64_t)d << 32) | ((uint64_t)i << 16);
+            for (uint32_t o = 0; o < 0x10000; o += 0x40) if (*(volatile uint32_t*)(base + o)) { addr[n++] = base + o; break; } } }
+    if (n < 16) { rlog("gpumem self-test: only %d mapped pages found, skipped", n); return; }
+    char cso[MAX_PATH]; if (!GetEnvironmentVariableA("GTA6_GMTEST_CSO", cso, MAX_PATH)) { rlog("gpumem self-test: GTA6_GMTEST_CSO not set, skipped"); return; }
+    HANDLE f = CreateFileA(cso, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL); if (f == INVALID_HANDLE_VALUE) { rlog("gpumem self-test: %s missing", cso); return; }
+    DWORD sz = GetFileSize(f, NULL), rdn = 0; void* code = malloc(sz); ReadFile(f, code, sz, &rdn, NULL); CloseHandle(f);
+    D3D12_ROOT_PARAMETER1 rp[3] = { 0 };
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[0].Constants.Num32BitValues = 32;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC vd = { D3D_ROOT_SIGNATURE_VERSION_1_1 };
+    vd.Desc_1_1.NumParameters = 3; vd.Desc_1_1.pParameters = rp; vd.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+    ID3DBlob *blob = NULL, *err = NULL; ID3D12RootSignature* rs = NULL; ID3D12PipelineState* pso = NULL;
+    if (FAILED(D3D12SerializeVersionedRootSignature(&vd, &blob, &err)) || FAILED(ID3D12Device_CreateRootSignature(g_dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void**)&rs))) { rlog("gpumem self-test: root signature failed"); free(code); return; }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd = { rs, { code, sz } };
+    HRESULT hr = ID3D12Device_CreateComputePipelineState(g_dev, &cd, &IID_ID3D12PipelineState, (void**)&pso); free(code);
+    if (FAILED(hr)) { rlog("gpumem self-test: pipeline failed 0x%08lX", hr); return; }
+    D3D12_HEAP_PROPERTIES dh = { D3D12_HEAP_TYPE_DEFAULT }, rbh = { D3D12_HEAP_TYPE_READBACK };
+    D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+    ID3D12Resource *ob = NULL, *rb = NULL;
+    ID3D12Device_CreateCommittedResource(g_dev, &dh, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void**)&ob);
+    rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    ID3D12Device_CreateCommittedResource(g_dev, &rbh, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&rb);
+    if (!ob || !rb) { rlog("gpumem self-test: buffers failed"); return; }
+    uint32_t cpu[16]; for (int i = 0; i < 16; i++) cpu[i] = *(volatile uint32_t*)addr[i];    /* what the CPU sees (pages are mapped) */
+    ID3D12CommandAllocator* al = NULL; ID3D12GraphicsCommandList* cl = NULL;
+    ID3D12Device_CreateCommandAllocator(g_dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&al);
+    ID3D12Device_CreateCommandList(g_dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, pso, &IID_ID3D12GraphicsCommandList, (void**)&cl);
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(cl, 1, &g_srvheap);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(cl, rs);
+    uint32_t c32[32]; for (int i = 0; i < 16; i++) { c32[2 * i] = (uint32_t)addr[i]; c32[2 * i + 1] = (uint32_t)(addr[i] >> 32); }
+    ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(cl, 0, 32, c32, 0);
+    ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(cl, 1, ID3D12Resource_GetGPUVirtualAddress(g_ptab));
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(cl, 2, ID3D12Resource_GetGPUVirtualAddress(ob));
+    ID3D12GraphicsCommandList_Dispatch(cl, 1, 1, 1);
+    D3D12_RESOURCE_BARRIER b = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION }; b.Transition.pResource = ob; b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    ID3D12GraphicsCommandList_ResourceBarrier(cl, 1, &b);
+    ID3D12GraphicsCommandList_CopyBufferRegion(cl, rb, 0, ob, 0, 64);
+    ID3D12GraphicsCommandList_Close(cl);
+    ID3D12CommandQueue_ExecuteCommandLists(g_q, 1, (ID3D12CommandList**)&cl);
+    UINT64 v = g_fencenext++; ID3D12CommandQueue_Signal(g_q, g_fence, v); ID3D12Fence_SetEventOnCompletion(g_fence, v, g_fev); WaitForSingleObject(g_fev, 3000);
+    uint32_t* m = NULL; D3D12_RANGE r = { 0, 64 }; int bad = 0;
+    if (SUCCEEDED(ID3D12Resource_Map(rb, 0, &r, (void**)&m)) && m) {
+        for (int i = 0; i < 16; i++) { if (m[i] != cpu[i]) bad++; if (i < 4 || m[i] != cpu[i]) rlog("gpumem self-test: va %llX  cpu %08X  gpu %08X", addr[i], cpu[i], m[i]); }
+        rlog("gpumem self-test: %s (%d of 16 differ; game memory can change between the CPU read and the GPU read)", bad ? "MISMATCH" : "OK, GPU reads the game's memory in place", bad);
+    } else rlog("gpumem self-test: readback failed, device state 0x%08lX", ID3D12Device_GetDeviceRemovedReason(g_dev));
 }
 
 /* ---- DXIL draws: the game's own portable shaders run on the real GPU ----
@@ -173,13 +290,15 @@ static ID3D12PipelineState* get_xpso(uint64_t vh, uint64_t ph) {
     if (g_nxpsos >= 256) return NULL;
     XPso* e = &g_xpsos[g_nxpsos++]; e->vh = vh; e->ph = ph; e->pso = NULL;
     char dir[MAX_PATH]; if (!GetEnvironmentVariableA("GTA6_XLAT_DIR", dir, MAX_PATH)) return NULL;
-    if (!g_xrs) {
-        D3D12_ROOT_PARAMETER p[2] = { 0 };
+    if (!g_xrs) {     /* b0 = 20 constants (16 user SGPRs + spare), t0 = pool page table; pool sections via ResourceDescriptorHeap */
+        D3D12_ROOT_PARAMETER1 p[2] = { 0 };
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; p[0].Constants.Num32BitValues = 20; p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC rd = { 2, p, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC rd = { D3D_ROOT_SIGNATURE_VERSION_1_1 };
+        rd.Desc_1_1.NumParameters = 2; rd.Desc_1_1.pParameters = p;
+        rd.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
         ID3DBlob *blob = NULL, *err = NULL;
-        if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err))) return NULL;
+        if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &blob, &err))) { rlog("translated root signature serialize failed: %s", err ? (char*)ID3D10Blob_GetBufferPointer(err) : "?"); return NULL; }
         HRESULT hr = ID3D12Device_CreateRootSignature(g_dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void**)&g_xrs);
         ID3D10Blob_Release(blob); if (FAILED(hr)) { rlog("translated root signature failed 0x%08lX", hr); return NULL; }
     }
@@ -215,6 +334,8 @@ static void run_xlat(UINT bi, D3D12_CPU_DESCRIPTOR_HANDLE rtv, float sx, float s
     }
     D3D12_GPU_VIRTUAL_ADDRESS gbase = ID3D12Resource_GetGPUVirtualAddress(g_upload[bi]); size_t off = 0;
     ID3D12GraphicsCommandList_OMSetRenderTargets(g_list, 1, &rtv, FALSE, NULL);
+    if (!g_ptab || !g_srvheap) { g_nxq = 0; return; }
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(g_list, 1, &g_srvheap);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(g_list, g_xrs);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(g_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     for (int i = 0; i < g_nxq; i++) {
@@ -233,9 +354,9 @@ static void run_xlat(UINT bi, D3D12_CPU_DESCRIPTOR_HANDLE rtv, float sx, float s
         ID3D12GraphicsCommandList_RSSetViewports(g_list, 1, &v); ID3D12GraphicsCommandList_RSSetScissorRects(g_list, 1, &sc);
         ID3D12GraphicsCommandList_SetPipelineState(g_list, q->pso);
         ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(g_list, 0, 20, rc, 0);
-        ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(g_list, 1, gbase + off);
+        ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(g_list, 1, ID3D12Resource_GetGPUVirtualAddress(g_ptab));
         ID3D12GraphicsCommandList_DrawInstanced(g_list, q->verts, q->insts ? q->insts : 1, 0, 0);
-        off = (off + q->winlen + 255) & ~(size_t)255;
+        off = (off + q->winlen + 255) & ~(size_t)255; (void)gbase;
     }
     static int logged; if (logged++ < 3) rlog("frame ran %d draws with TRANSLATED game shaders on the real GPU", g_nxq);
     g_nxq = 0;
@@ -244,6 +365,7 @@ static void run_xlat(UINT bi, D3D12_CPU_DESCRIPTOR_HANDLE rtv, float sx, float s
 /* Clear the next back buffer to rgba and present it (sync interval 0: pacing is done by the caller). */
 int rg_present_clear(const float* rgba) {
     if (g_state != 1) return 0;
+    gm_sync(); gm_selftest();
     UINT i = IDXGISwapChain3_GetCurrentBackBufferIndex(g_sc);
     if (ID3D12Fence_GetCompletedValue(g_fence) < g_fenceval[i]) { ID3D12Fence_SetEventOnCompletion(g_fence, g_fenceval[i], g_fev); WaitForSingleObject(g_fev, 1000); }
     ID3D12CommandAllocator_Reset(g_alloc[i]);

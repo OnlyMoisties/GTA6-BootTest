@@ -93,7 +93,9 @@ int wmain(int argc, wchar_t** argv) {
 
     while (!done) {
         DEBUG_EVENT ev;
-        if (!WaitForDebugEvent(&ev, 500)) {
+        BOOL got = WaitForDebugEvent(&ev, 500);
+        if (got && GetTickCount64() > deadline) { ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE); got = FALSE; }   /* event flood (e.g. ODS spam) must not stop the timeout */
+        if (!got) {
             if (GetTickCount64() > deadline) {
                 L("TIMEOUT after %ds: process still alive (%d threads). Thread states:", timeout, g_nthr);
                 for (int i = 0; i < g_nthr && i < 24; i++) { SuspendThread(g_thr[i].h); char tg[32]; snprintf(tg, 32, "tid %lu", g_thr[i].id); dump(g_thr[i].h, tg); }

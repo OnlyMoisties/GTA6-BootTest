@@ -90,6 +90,9 @@ static const struct { const char* name; void* fn; } g_hooks[] = {
     { "FindFirstFileW", h_FindFirstFileW }, { "GetDiskFreeSpaceExW", h_GetDiskFreeSpaceExW }, { "GetFileAttributesExW", h_GetFileAttributesExW },
     { "GetFileAttributesW", h_GetFileAttributesW }, { "GetFileAttributesA", h_GetFileAttributesA }, { "RemoveDirectoryW", h_RemoveDirectoryW },
     { "SetFileAttributesW", h_SetFileAttributesW }, { "MoveFileExW", h_MoveFileExW },
+#ifdef FS_MEMHOOKS
+    { "VirtualAlloc", h_VirtualAlloc }, { "VirtualFree", h_VirtualFree },     /* GPU memory pool ranges (xmem.c) */
+#endif
 };
 static void fs_install(void) {
     BYTE* base = (BYTE*)GetModuleHandleW(NULL);
