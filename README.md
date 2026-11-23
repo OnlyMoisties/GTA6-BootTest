@@ -11,7 +11,7 @@ The technical findings are in [REPORT.md](REPORT.md).
 | Part | Role |
 |---|---|
 | `src/xmem.c` | Xbox memory API: placeholders, physical pages, commit-on-touch VEH, title allocation hooks. Also installs IAT hooks: `G:` package-root redirect, window made borderless fullscreen, `QueryApiImpl` proxies, Bink hooks. |
-| `src/d3d12_xs.c` | Probe D3D12.X device: logging COM objects, creator-method table, resource memory, fences, `PresentX` → GDI blit with a status line. |
+| `src/d3d12_xs.c` | Probe D3D12.X device: logging COM objects, creator-method table, resource memory, fences, `PresentX` -> GDI blit with a status line. |
 | `src/XCRDAPI.c` + `src/inflate.h` | DirectStorage queue with synchronous reads and zlib. |
 | `src/xg_xs.c` | Texture-computer probe. |
 | `src/audio_stubs.c` | APU heap and shape contexts; no-op XApu/XDsp (silent). |
@@ -35,7 +35,7 @@ Environment switches: `GTA6_WINDOWED=1`, `GTA6_NO_XGR_PROXY=1`, `GTA6_NO_FAKE_US
 
 ## Not done
 
-- RDNA2 → DXIL/SPIR-V shader translation and a real renderer
+- RDNA2 -> DXIL/SPIR-V shader translation and a real renderer
 - DirectStorage formats `0x02` / `0x0E` (Series texture codecs)
 - Saves, input mapping, audio output
 - The submit race at `exe+0x24821FE`

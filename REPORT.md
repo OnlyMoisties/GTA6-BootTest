@@ -14,7 +14,7 @@ With stand-in DLLs, no patches to the exe on disk, and a small debugger harness,
 - runs its full frame loop: about 100k command-list calls and 70k `ExecuteCommandLists` per 5 s, `PresentX` at about 600 fps against an instant fake GPU
 - plays intro-video audio
 
-**Nothing is drawn.** The title's shaders are native RDNA2 machine code (see the end of this report), so pixels need an RDNA2 → DXIL/SPIR-V translator plus a real D3D12.X → D3D12 renderer. This report covers everything up to that wall.
+**Nothing is drawn.** The title's shaders are native RDNA2 machine code (see the end of this report), so pixels need an RDNA2 -> DXIL/SPIR-V translator plus a real D3D12.X -> D3D12 renderer. This report covers everything up to that wall.
 
 ## Static imports that do not exist on Windows
 
@@ -28,7 +28,7 @@ The title opens its package files as `G:\...` (for example `G:\appdata0.rpf`). R
 
 | Function | What worked |
 |---|---|
-| `XMemVirtualAlloc(addr,size,type,a4,a5)` | type `0x40000` = reserve placeholder, `0x4000` = replace placeholder (VirtualAlloc2). Low byte of a5 = page protection. The title reserves 2 × 24 GB and uses it on demand, so commit-on-touch via a vectored exception handler (VEH) is needed. |
+| `XMemVirtualAlloc(addr,size,type,a4,a5)` | type `0x40000` = reserve placeholder, `0x4000` = replace placeholder (VirtualAlloc2). Low byte of a5 = page protection. The title reserves 2 x 24 GB and uses it on demand, so commit-on-touch via a vectored exception handler (VEH) is needed. |
 | `XMemAllocatePhysicalPages(flags,&count,pages)` | 64 KB page numbers; return TRUE, count unchanged |
 | `XMemMapPhysicalPages(addr,count,pages)` | returns addr; pages==NULL means unmap |
 | `XMemMapPhysicalPagesScatter(addrArray,count,pages)` | commit each address; must return nonzero (assert `exe+0xF2CC4B`) |
@@ -69,8 +69,8 @@ Device vtable: slots 0-43 match public `ID3D12Device`. Xbox additions:
 - **Descriptor heaps:** the desc carries a title-chosen address at `+0x10`, and the heap start must equal it.
 - **Sizes:** `GetResourceAllocationInfo` must use real format sizes and mip chains. Over-estimating fills the title's fixed GPU heaps and hits its OOM handler at `exe+0x2219620`.
 - **Fences:** slot 12 returns the **address** of the completed value, which the title polls.
-- **Queue:** slot 16 = `Signal(fence,value)`, 35 = `ExecuteCommandLists`, 32 = `PresentX(planeCount, planes, params)` (plane `+0x10` → back-buffer resource array, two 3840×2160; params `+0x28` = rect), 31 = tile-mapping update.
-- **DXGI chain:** `QI(IDXGIDevice)` → `GetAdapter` (slot 7) → `EnumOutputs(0)` (slot 7) → output slot 21 mode list (the title looks for 120 Hz; 0 modes is accepted).
+- **Queue:** slot 16 = `Signal(fence,value)`, 35 = `ExecuteCommandLists`, 32 = `PresentX(planeCount, planes, params)` (plane `+0x10` -> back-buffer resource array, two 3840x2160; params `+0x28` = rect), 31 = tile-mapping update.
+- **DXGI chain:** `QI(IDXGIDevice)` -> `GetAdapter` (slot 7) -> `EnumOutputs(0)` (slot 7) -> output slot 21 mode list (the title looks for 120 Hz; 0 modes is accepted).
 - **Object count:** the title creates more than 53k D3D objects during boot; size stand-ins accordingly.
 
 ## xg_xs, audio
