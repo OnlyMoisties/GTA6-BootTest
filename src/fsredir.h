@@ -84,7 +84,7 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD s
 #include "binkview.h"
 static const struct { const char* name; void* fn; } g_hooks[] = {
     { "CreateWindowExA", h_CreateWindowExA },
-    { "BinkDoFrame", h_BinkDoFrame }, { "BinkDoFrameAsyncWait", h_BinkDoFrameAsyncWait }, { "BinkOpenWithOptions", h_BinkOpenWithOptions },
+    { "BinkDoFrame", h_BinkDoFrame }, { "BinkDoFrameAsyncWait", h_BinkDoFrameAsyncWait }, { "BinkOpenWithOptions", h_BinkOpenWithOptions }, { "BinkClose", h_BinkClose },
     { "GetProcAddress", h_GetProcAddress }, { "LoadLibraryExW", h_LoadLibraryExW }, { "LoadLibraryW", h_LoadLibraryW }, { "LoadLibraryExA", h_LoadLibraryExA },
     { "CreateFileW", h_CreateFileW }, { "CreateDirectoryW", h_CreateDirectoryW }, { "DeleteFileW", h_DeleteFileW },
     { "FindFirstFileW", h_FindFirstFileW }, { "GetDiskFreeSpaceExW", h_GetDiskFreeSpaceExW }, { "GetFileAttributesExW", h_GetFileAttributesExW },
@@ -107,6 +107,7 @@ static void fs_install(void) {
             for (int i = 0; i < (int)(sizeof g_hooks / sizeof g_hooks[0]); i++) if (!strcmp(nm, g_hooks[i].name)) {
                 if (!strcmp(nm, "BinkDoFrame")) g_bkDo = (BinkDoFrameFn)iat->u1.Function;
                 if (!strcmp(nm, "BinkOpenWithOptions")) g_bkOpen = (BinkOpenWOFn)iat->u1.Function;
+                if (!strcmp(nm, "BinkClose")) g_bkClose = (BinkCloseFn2)iat->u1.Function;
                 if (!strcmp(nm, "BinkDoFrameAsyncWait")) g_bkWait = (BinkWaitFn)iat->u1.Function;
                 DWORD old; if (VirtualProtect(&iat->u1.Function, 8, PAGE_READWRITE, &old)) { iat->u1.Function = (ULONGLONG)g_hooks[i].fn; VirtualProtect(&iat->u1.Function, 8, old, &old); patched++; }
             }

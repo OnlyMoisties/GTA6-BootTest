@@ -106,26 +106,60 @@ static void blit_bgra(const uint8_t* px, uint32_t W, uint32_t H) {
     ReleaseDC(hwnd, dc);
     g_videoTick = GetTickCount64();
 }
+static void* volatile g_gameBink;        /* the game's own HBINK for the video being shown (frame clock) */
+static volatile ULONGLONG g_gameOpenTick; /* when the game opened it: Bink starts the audio then */
+static volatile uint32_t g_gameFlags;
+static volatile LONG g_gameBinkClosed;
+typedef void (*BkGotoFn)(void*, uint32_t, int32_t);
 static DWORD WINAPI cpu_viewer(void* data) {
     HMODULE bk = GetModuleHandleA("Bink2Scarlett.dll");
+    BkGotoFn gto = (BkGotoFn)GetProcAddress(bk, "BinkGoto");
     BkOpenFn op = (BkOpenFn)GetProcAddress(bk, "BinkOpenWithOptions"); BkDoFn dof = (BkDoFn)GetProcAddress(bk, "BinkDoFrame");
     BkNextFn nx = (BkNextFn)GetProcAddress(bk, "BinkNextFrame"); BkCopyFn cp = (BkCopyFn)GetProcAddress(bk, "BinkCopyToBuffer");
     BkCloseFn cl = (BkCloseFn)GetProcAddress(bk, "BinkClose"); BkSoundFn snd = (BkSoundFn)GetProcAddress(bk, "BinkSetSoundOnOff");
     if (!op || !dof || !nx || !cp || !cl) { vlog("missing Bink exports (open=%p do=%p next=%p copy=%p close=%p)", op, dof, nx, cp, cl); goto out; }
-    void* b = op((const char*)data, NULL, 0x04000000);                    /* from memory, CPU frame buffers, nothing else */
-    if (!b) { vlog("private BinkOpen failed"); goto out; }
+    /* from memory with CPU frame buffers; if the plain open fails, retry with the game's flags minus likely GPU bits */
+    uint32_t gf = g_gameFlags, tries[5] = { 0x04000000, gf & ~0x00100000u, gf & ~0x00100400u, gf & ~0x00104400u, gf & ~0x00104000u };
+    void* b = NULL; uint32_t used = 0;
+    for (int t = 0; t < 5 && !b; t++) { if (t && tries[t] == tries[t - 1]) continue; b = op((const char*)data, NULL, tries[t]); used = tries[t]; }
+    if (!b) { vlog("private BinkOpen failed with all flag sets (game flags 0x%08X)", gf); goto out; }
+    vlog("private open flags 0x%08X (game used 0x%08X)", used, gf);
     uint32_t W = ((uint32_t*)b)[0], H = ((uint32_t*)b)[1], frames = ((uint32_t*)b)[2];
     uint32_t fr = ((uint32_t*)b)[5], frd = ((uint32_t*)b)[6]; if (!fr || fr > 240) fr = 30; if (!frd || frd > 1000) frd = 1;
     if (snd) snd(b, 0);                                                    /* the game already plays the audio */
     vlog("private decode open: %ux%u, %u frames, rate %u/%u", W, H, frames, fr, frd);
     uint8_t* px = (uint8_t*)VirtualAlloc(NULL, (size_t)W * H * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     ULONGLONG t0 = GetTickCount64();
-    for (uint32_t i = 0; px && i < frames; i++) {
+    /* Follow the game's own frame clock: the game's HBINK FrameNum (+0x0C, 1-based) is the frame its audio is on.
+       Decode/seek our private copy to that frame and show it; stop when the game closes the video. */
+    uint32_t shown = 0, ours = 1, lastTarget = 0; ULONGLONG lastMove = GetTickCount64();
+    ULONGLONG closedAt = 0;
+    while (px) {
+        void* gb = g_gameBink;
+        if (g_gameBinkClosed || !gb) {                                     /* closed: wait briefly for a reopen */
+            if (!closedAt) closedAt = GetTickCount64();
+            if (GetTickCount64() - closedAt > 1000) break;
+            Sleep(5); continue;
+        }
+        closedAt = 0;
+        /* frame clock: the game's FrameNum when it advances; otherwise elapsed time since the game opened the video
+           (that is when Bink starts the audio), at the video's own frame rate */
+        uint32_t gameFrame = ((volatile uint32_t*)gb)[3];
+        uint32_t timeFrame = 1 + (uint32_t)((GetTickCount64() - g_gameOpenTick) * fr / (1000ull * frd));
+        uint32_t target = (gameFrame > 1 && gameFrame <= frames) ? gameFrame : timeFrame;
+        if (target > frames) break;                                         /* past the end */
+        (void)lastMove;
+        if (target == shown) { Sleep(2); continue; }
+        if (target < ours || target > ours + 4) { if (gto) { gto(b, target, 0); ours = target; } }
+        while (ours < target) { dof(b); nx(b); ours++; }                    /* catch up a few frames */
         ULONGLONG f0 = GetTickCount64();
         dof(b);
+        uint32_t i = target - 1;
         int32_t cr = cp(b, px, (int32_t)(W * 4), H, 0, 0, 3);              /* 3 = 32-bit BGRx surface */
-        if (i < 3 || (i & 63) == 0) vlog("frame %u decoded+copied in %llu ms (copy rc=%d)", i, GetTickCount64() - f0, cr);
+        if (shown < 3 || (i & 63) == 0) vlog("frame %u (game clock) decoded+copied in %llu ms (copy rc=%d)", i, GetTickCount64() - f0, cr);
         blit_bgra(px, W, H);
+        shown = target;
+        if (ours < frames) { nx(b); ours++; }
         {   /* GTA6_DUMP_FRAME=<n>: save decoded frame n as frame.bmp next to the log, for checking */
             char e[32]; if (GetEnvironmentVariableA("GTA6_DUMP_FRAME", e, sizeof e) && (uint32_t)atoi(e) == i) {
                 char path[MAX_PATH]; if (GetEnvironmentVariableA("GTA6_STUB_LOG", path, MAX_PATH)) {
@@ -137,10 +171,8 @@ static DWORD WINAPI cpu_viewer(void* data) {
                 }
             }
         }
-        if (i + 1 < frames) nx(b);
-        ULONGLONG due = t0 + (ULONGLONG)(i + 1) * 1000ull * frd / fr, now = GetTickCount64();
-        if (due > now) Sleep((DWORD)(due - now));
     }
+    (void)fr; (void)frd;
     vlog("private decode finished after %llu ms", GetTickCount64() - t0);
     cl(b); if (px) VirtualFree(px, 0, MEM_RELEASE);
 out:
@@ -167,7 +199,11 @@ static void* h_BinkOpenWithOptions(const char* name, void* opts, uint32_t flags)
     uint32_t want = flags;
     char cl[64]; if (GetEnvironmentVariableA("GTA6_BINK_CLEAR", cl, sizeof cl)) want &= ~(uint32_t)_strtoui64(cl, NULL, 16);
     void* r = g_bkOpen(name, opts, want);
-    if (r && (flags & 0x04000000) && !GetEnvironmentVariableA("GTA6_NO_VIDEO_VIEW", NULL, 0)) start_cpu_viewer(name);
+    if (r && (flags & 0x04000000) && !GetEnvironmentVariableA("GTA6_NO_VIDEO_VIEW", NULL, 0)) {
+        g_gameBink = r; g_gameBinkClosed = 0;          /* the viewer always follows the newest game handle */
+        g_gameOpenTick = GetTickCount64(); g_gameFlags = flags;
+        if (!g_viewerBusy) start_cpu_viewer(name);
+    }
     char path[MAX_PATH], buf[1200]; int m = 0;
     if (GetEnvironmentVariableA("GTA6_STUB_LOG", path, MAX_PATH)) {
         char nm[200] = "?"; MEMORY_BASIC_INFORMATION mi;
@@ -180,6 +216,12 @@ static void* h_BinkOpenWithOptions(const char* name, void* opts, uint32_t flags)
         if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, buf, m, &w, NULL); CloseHandle(h); }
     }
     return r;
+}
+typedef void (*BinkCloseFn2)(void*);
+static BinkCloseFn2 g_bkClose;
+static void h_BinkClose(void* b) {
+    if (b && b == g_gameBink) { g_gameBinkClosed = 1; g_gameBink = NULL; Sleep(20); }   /* viewer stops reading it first */
+    g_bkClose(b);
 }
 typedef int32_t (*BinkDoFrameFn)(void*);
 typedef int32_t (*BinkWaitFn)(void*, int32_t);

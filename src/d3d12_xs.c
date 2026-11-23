@@ -318,6 +318,23 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
         if (slot == 10) { FENCEVAL(id) = arg[0]; return 0; }     /* Signal(value) from the CPU */
         if (slot == 12) return (uint64_t)&FENCEVAL(id);          /* Xbox: address of the completed value, polled by the title */
     }
+    if (id == 0 && slot == 67 && readable(arg[0], 0x38)) {     /* dump each unique shader blob: code at desc+0x28, size at desc+0x30 */
+        uint64_t code = ((uint64_t*)arg[0])[5], size = ((uint64_t*)arg[0])[6];
+        if (size >= 16 && size <= (4u << 20) && readable(code, (size_t)size)) {
+            uint64_t h = 1469598103934665603ull; for (uint64_t i = 0; i < size; i++) { h ^= ((uint8_t*)code)[i]; h *= 1099511628211ull; }
+            static volatile LONG nd; static uint64_t seen[65536]; static SRWLOCK lk = SRWLOCK_INIT; int isnew = 1;
+            AcquireSRWLockExclusive(&lk);
+            for (LONG i = 0; i < nd && i < 65536; i++) if (seen[i] == h) { isnew = 0; break; }
+            if (isnew && nd < 65536) seen[nd++] = h;
+            ReleaseSRWLockExclusive(&lk);
+            char path[MAX_PATH];
+            if (isnew && GetEnvironmentVariableA("GTA6_STUB_LOG", path, MAX_PATH)) {
+                char* s = strrchr(path, '\\'); if (s) { strcpy(s + 1, "shaders"); CreateDirectoryA(path, NULL); snprintf(s + 1, MAX_PATH - (s + 1 - path), "shaders\\%016llX.bin", h); }
+                HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
+                if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, (void*)code, (DWORD)size, &w, NULL); CloseHandle(f); }
+            }
+        }
+    }
     if (id == 0 && (slot == 55 || slot == 57 || slot == 62 || slot == 67 || slot == 86)) {   /* pipeline creators: learn the desc layout */
         static volatile LONG pc2[128]; uint64_t dp = (slot == 55) ? arg[2] : arg[0];
         if (InterlockedIncrement(&pc2[slot]) <= 2 && readable(dp, 128)) {
