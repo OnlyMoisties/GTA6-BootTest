@@ -8,6 +8,10 @@ import xml.etree.ElementTree as ET
 BASE_ENCODINGS = ["ENC_SOP1", "ENC_SOPC", "ENC_SOPP", "ENC_SOPK", "ENC_SOP2", "ENC_SMEM", "ENC_VOP1", "ENC_VOPC", "ENC_VOP2",
                   "ENC_VINTRP", "ENC_VOP3", "ENC_VOP3P", "ENC_DS", "ENC_MUBUF", "ENC_MTBUF", "ENC_MIMG", "ENC_EXP", "ENC_FLAT",
                   "ENC_FLAT_GLBL", "ENC_FLAT_SCRATCH"]
+# literal-only variants: opcodes listed only here always carry a trailing 32-bit literal
+LITERAL_VARIANTS = {"SOP1_INST_LITERAL": "ENC_SOP1", "SOP2_INST_LITERAL": "ENC_SOP2", "SOPC_INST_LITERAL": "ENC_SOPC",
+                    "SOPK_INST_LITERAL": "ENC_SOPK", "VOP1_INST_LITERAL": "ENC_VOP1", "VOP2_INST_LITERAL": "ENC_VOP2",
+                    "VOPC_INST_LITERAL": "ENC_VOPC", "VOP3_INST_LITERAL": "ENC_VOP3", "VOP3P_INST_LITERAL": "ENC_VOP3P"}
 
 def load_spec(path):
     cache = path + ".pickle"
@@ -15,8 +19,11 @@ def load_spec(path):
         return pickle.load(open(cache, "rb"))
     isa = ET.parse(path).getroot().find("ISA")
     encs = {}
+    variant_ids = collections.defaultdict(set)
     for e in isa.find("Encodings"):
         name = e.findtext("EncodingName")
+        if name in LITERAL_VARIANTS:                      # their identifiers (low dword) also identify the base encoding
+            variant_ids[LITERAL_VARIANTS[name]] |= {int(x.text, 2) & 0xFFFFFFFF for x in e.find("EncodingIdentifiers")}
         if name not in BASE_ENCODINGS: continue
         bits = int(e.findtext("BitCount"))
         mask = int(e.find("EncodingIdentifierMask").text, 2)
@@ -26,16 +33,22 @@ def load_spec(path):
             rngs = [(int(r.findtext("BitOffset")), int(r.findtext("BitCount"))) for r in f.find("BitLayout")]
             fields[f.findtext("FieldName")] = rngs
         encs[name] = dict(bits=bits, mask=mask, ids=ids, fields=fields)
-    ops = collections.defaultdict(dict)        # encoding -> opcode -> (name, [operand field names])
+    ops = collections.defaultdict(dict)        # encoding -> opcode -> (name, [operand field names], always_literal)
+    litonly = []
     for i in isa.find("Instructions"):
         nm = i.findtext("InstructionName")
         for ie in i.find("InstructionEncodings"):
             en = ie.findtext("EncodingName")
-            if en not in encs: continue
             opc = int(ie.findtext("Opcode"))
             operands = [o.findtext("FieldName") for o in ie.find("Operands")] if ie.find("Operands") is not None else []
-            ops[en].setdefault(opc, (nm, operands))
-    spec = dict(encs=encs, ops=dict(ops))
+            if en in encs: ops[en].setdefault(opc, (nm, operands, False))
+            elif en in LITERAL_VARIANTS: litonly.append((LITERAL_VARIANTS[en], opc, nm, operands))
+    for base, opc, nm, operands in litonly:
+        if opc not in ops[base]: ops[base][opc] = (nm, operands, True)
+    for base, ids in variant_ids.items():
+        m = encs[base]["mask"] & 0xFFFFFFFF
+        encs[base]["ids"] = set(encs[base]["ids"]) | {i & m for i in ids}
+    spec = dict(encs=encs, ops=dict(ops), version=2)
     pickle.dump(spec, open(cache, "wb"))
     return spec
 
@@ -83,12 +96,12 @@ def decode(spec, code, pc):
     v = d0 if size == 4 else d0 | (struct.unpack_from("<I", code, pc + 4)[0] << 32 if pc + 8 <= len(code) else 0)
     f = {k: field(v, r) for k, r in e["fields"].items()}
     opc = f.get("OP", 0)
-    nm, operands = spec["ops"].get(en, {}).get(opc, ("%s_op%d" % (en, opc), []))
+    nm, operands, always_lit = spec["ops"].get(en, {}).get(opc, ("%s_op%d" % (en, opc), [], False))
     extra = 0
     srcs = [k for k in ("SSRC0", "SSRC1", "SRC0", "SRC1", "SRC2") if k in f]
-    if any(f[k] == 255 for k in srcs): extra = 4                       # 32-bit literal follows
+    if always_lit or any(f[k] == 255 for k in srcs): extra = 4         # 32-bit literal follows
     if en in ("ENC_VOP1", "ENC_VOP2", "ENC_VOPC") and f.get("SRC0") in (249, 250, 233, 234): extra = 4   # SDWA / DPP word
-    if en == "ENC_SOPK" and nm in ("S_SETREG_IMM32_B32",): extra = 4
+    if en == "ENC_MIMG" and f.get("NSA"): extra = 4 * f["NSA"]         # non-sequential address dwords
     parts = []
     for k in operands:
         if k not in f: continue
@@ -97,7 +110,13 @@ def decode(spec, code, pc):
         elif k in ("VSRC1",): parts.append("v%d" % val)
         elif k in ("SDST",): parts.append(src_name(val))
         elif k in ("VDST", "VADDR", "VDATA", "DATA0", "DATA1", "ADDR"): parts.append("v%d" % val)
+        elif k in ("SBASE",): parts.append("s[%d:%d]" % (val * 2, val * 2 + 1))
+        elif k in ("SDATA",): parts.append("s%d" % val)
+        elif k in ("SRSRC", "SSAMP"): parts.append("s[%d:]" % (val * 4))
         else: parts.append("%s=%d" % (k.lower(), val))
+    # fields the operand list omits but that matter for memory access
+    for k in ("OFFSET", "OFFSET0", "OFFSET1", "SOFFSET", "DMASK", "DIM", "OFFEN", "IDXEN", "GLC", "FORMAT"):
+        if k in f and k not in operands and f[k]: parts.append("%s=%s" % (k.lower(), hex(f[k]) if k.startswith("OFFSET") else f[k]))
     lit = ""
     if extra and pc + size + 4 <= len(code): lit = "  ; extra=0x%08X" % struct.unpack_from("<I", code, pc + size)[0]
     return nm, size + extra, "%-28s %s%s" % (nm.lower(), ", ".join(parts), lit)

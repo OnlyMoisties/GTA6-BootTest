@@ -79,7 +79,13 @@ static const char* hx(uint64_t v, int bytes) {
 #define OBJMAGIC 0x45424F5250424F50ull   /* "POBPRBOE" tag at +0xFF0, object id at +0xFF8 */
 static void* g_dvt[NPROBE];
 enum { KIND_GENERIC, KIND_DXGIDEV, KIND_ADAPTER, KIND_OUTPUT, KIND_FACTORY };
-typedef struct { void* p; int parent, slot, kind; GUID iid; void* aux; volatile LONG calls; } ObjInfo;
+typedef struct { void* p; int parent, slot, kind; GUID iid; void* aux; void* meta; volatile LONG calls; } ObjInfo;
+/* ---- command recording (emulator step 1) ----
+   Command lists keep a record buffer: {u32 slot, u32 nextra, u64 a[6]} followed by nextra extra dwords (copied data).
+   Pipeline objects keep meta = PsoMeta (shader code, size, hash, copy of the creation desc). */
+typedef struct { uint64_t code, size, hash; uint8_t desc[0x180]; } PsoMeta;
+typedef struct { uint8_t* buf; size_t used, cap; } CmdRec;
+typedef struct { uint32_t slot, nextra; uint64_t a[6]; } RecHdr;
 static ObjInfo* g_obj;             /* MAXOBJ entries, allocated on first use */
 static void* g_dxgidev;
 static volatile LONG g_nobj, g_total;
@@ -193,6 +199,50 @@ static void show_frame(void* pixels, uint32_t w, uint32_t h, LONG frame) {
     SetBkMode(dc, OPAQUE); SetBkColor(dc, RGB(0, 0, 0)); SetTextColor(dc, RGB(255, 210, 0));
     TextOutA(dc, 16, 16, s, n);
     ReleaseDC(hwnd, dc);
+}
+/* Walk one recorded command list, tracking compute state; log each new (shader, dispatch) combination once.
+   This is where the interpreter will execute dispatches. */
+static void replay_list(int lid) {
+    if (lid <= 0 || !g_obj[lid].meta) return;
+    CmdRec* r = (CmdRec*)g_obj[lid].meta;
+    int pso = -1, rootsig = -1; uint64_t tables[16] = { 0 }, views[16] = { 0 }, heaps[2] = { 0 }; uint32_t consts[16][64]; uint32_t cmask[16] = { 0 };
+    static volatile LONG logged; static uint64_t seen[4096]; static LONG nseen;
+    for (size_t off = 0; off + sizeof(RecHdr) <= r->used;) {
+        RecHdr* h = (RecHdr*)(r->buf + off); const uint32_t* ex = (const uint32_t*)(h + 1);
+        switch (h->slot) {
+        case 25: pso = objid(h->a[0]); break;
+        case 29: rootsig = objid(h->a[0]); break;
+        case 28: for (uint32_t i = 0; i < h->nextra / 2 && i < 2; i++) heaps[i] = ((const uint64_t*)ex)[i]; break;
+        case 31: if (h->a[0] < 16) tables[h->a[0]] = h->a[1]; break;
+        case 37: case 39: case 41: if (h->a[0] < 16) views[h->a[0]] = h->a[1]; break;
+        case 33: if (h->a[0] < 16 && h->a[2] < 64) { consts[h->a[0]][h->a[2]] = (uint32_t)h->a[1]; cmask[h->a[0]] |= 1; } break;
+        case 35: if (h->a[0] < 16) for (uint32_t i = 0; i < h->nextra && h->a[3] + i < 64; i++) { consts[h->a[0]][h->a[3] + i] = ex[i]; cmask[h->a[0]] |= 1; } break;
+        case 14: {
+            static volatile LONG seqdump;
+            if (InterlockedIncrement(&seqdump) <= 2) {               /* full call sequence of this list up to the dispatch */
+                dlog("SEQ list obj#%d up to dispatch #%ld:", lid, seqdump);
+                for (size_t o2 = 0; o2 + sizeof(RecHdr) <= off;) {
+                    RecHdr* q = (RecHdr*)(r->buf + o2); const uint32_t* qx = (const uint32_t*)(q + 1);
+                    char ex2[200] = ""; size_t k2 = 0; for (uint32_t j = 0; j < q->nextra && j < 16 && k2 < 180; j++) k2 += snprintf(ex2 + k2, sizeof ex2 - k2, "%X ", qx[j]);
+                    dlog("   m%u (%llX, %llX, %llX, %llX, %llX) %s%s", q->slot, q->a[0], q->a[1], q->a[2], q->a[3], q->a[4], q->nextra ? "data: " : "", ex2);
+                    o2 += sizeof(RecHdr) + (size_t)q->nextra * 4;
+                }
+            }
+            PsoMeta* m = (pso > 0) ? (PsoMeta*)g_obj[pso].meta : NULL;
+            uint64_t key = (m ? m->hash : 0) ^ ((uint64_t)(uint32_t)h->a[0] << 40) ^ ((uint64_t)(uint32_t)h->a[1] << 20) ^ (uint32_t)h->a[2];
+            int isnew = 1; for (LONG i = 0; i < nseen && i < 4096; i++) if (seen[i] == key) { isnew = 0; break; }
+            if (isnew && nseen < 4096) seen[nseen++] = key;
+            if (isnew && InterlockedIncrement(&logged) <= 400) {
+                char cs[400] = ""; size_t k = 0;
+                for (int ri = 0; ri < 16 && k < 300; ri++) if (cmask[ri]) { k += snprintf(cs + k, sizeof cs - k, " r%d:[", ri); for (int j = 0; j < 8; j++) k += snprintf(cs + k, sizeof cs - k, "%X ", consts[ri][j]); k += snprintf(cs + k, sizeof cs - k, "]"); }
+                dlog("DISPATCH %ux%ux%u shader=%016llX(%llu bytes) pso=obj#%d rootsig=obj#%d heaps=%llX,%llX tables=%llX,%llX,%llX views=%llX,%llX,%llX%s",
+                    (uint32_t)h->a[0], (uint32_t)h->a[1], (uint32_t)h->a[2], m ? m->hash : 0, m ? m->size : 0, pso, rootsig, heaps[0], heaps[1],
+                    tables[0], tables[1], tables[2], views[0], views[1], views[2], cs);
+            }
+            break; }
+        }
+        off += sizeof(RecHdr) + (size_t)h->nextra * 4;
+    }
 }
 static volatile LONG g_kcnt[64][NPROBE];
 static volatile uint32_t g_kiid[64];
@@ -318,6 +368,21 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
         if (slot == 10) { FENCEVAL(id) = arg[0]; return 0; }     /* Signal(value) from the CPU */
         if (slot == 12) return (uint64_t)&FENCEVAL(id);          /* Xbox: address of the completed value, polled by the title */
     }
+    /* remember shader + desc on the created pipeline object (dev slot 67: ppv is arg[2]) */
+    if (id == 0 && slot == 67 && readable(arg[0], 0x38) && writable(arg[2], 8)) {
+        int po = objid(*(uint64_t*)arg[2]);
+        if (po > 0 && !g_obj[po].meta) {
+            PsoMeta* m = (PsoMeta*)calloc(1, sizeof(PsoMeta));
+            if (m) {
+                m->code = ((uint64_t*)arg[0])[5]; m->size = ((uint64_t*)arg[0])[6];
+                uint64_t h = 1469598103934665603ull;
+                if (m->size >= 16 && m->size <= (4u << 20) && readable(m->code, (size_t)m->size)) for (uint64_t i = 0; i < m->size; i++) { h ^= ((uint8_t*)m->code)[i]; h *= 1099511628211ull; }
+                m->hash = h;
+                if (readable(arg[0], sizeof m->desc)) memcpy(m->desc, (void*)arg[0], sizeof m->desc);
+                g_obj[po].meta = m;
+            }
+        }
+    }
     if (id == 0 && slot == 67 && readable(arg[0], 0x38)) {     /* dump each unique shader blob: code at desc+0x28, size at desc+0x30 */
         uint64_t code = ((uint64_t*)arg[0])[5], size = ((uint64_t*)arg[0])[6];
         if (size >= 16 && size <= (4u << 20) && readable(code, (size_t)size)) {
@@ -332,6 +397,15 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
                 char* s = strrchr(path, '\\'); if (s) { strcpy(s + 1, "shaders"); CreateDirectoryA(path, NULL); snprintf(s + 1, MAX_PATH - (s + 1 - path), "shaders\\%016llX.bin", h); }
                 HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
                 if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, (void*)code, (DWORD)size, &w, NULL); CloseHandle(f); }
+                /* the pipeline description (driver metadata: user-data mapping) next to it, plus what its pointers point at */
+                char* dot = strrchr(path, '.'); if (dot) strcpy(dot, ".desc");
+                f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
+                if (f != INVALID_HANDLE_VALUE) {
+                    DWORD w; uint8_t blob[0x180 + 16 * 0x100]; memset(blob, 0, sizeof blob);
+                    if (readable(arg[0], 0x180)) memcpy(blob, (void*)arg[0], 0x180);
+                    for (int i = 0; i < 16; i++) { uint64_t q = ((uint64_t*)blob)[i]; if (q != code && readable(q, 0x100)) memcpy(blob + 0x180 + i * 0x100, (void*)q, 0x100); }
+                    WriteFile(f, blob, sizeof blob, &w, NULL); CloseHandle(f);
+                }
             }
         }
     }
@@ -362,6 +436,38 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
                     dlog("   plane0 qword%d -> %s%s", i, hx(q[i], 16), o2 > 0 ? " (first entry is a probe object)" : ""); }
             }
         }
+    }
+    /* ---- record compute-relevant command-list calls ---- */
+    if (id > 0 && g_obj[id].iid.Data1 == 0x5B160D0F && !sret) {
+        int rec = 0; uint32_t extra = 0; const void* src = NULL;
+        switch (slot) {
+        case 10: {                                               /* Reset(allocator, pso): start a fresh recording */
+            CmdRec* r = (CmdRec*)g_obj[id].meta; if (r) r->used = 0; rec = 1; break; }
+        case 14: case 25: case 28: case 29: case 31: case 33: case 37: case 39: case 41: case 9: rec = 1; break;
+        default: if (slot >= 60) { rec = 1;                      /* Xbox-specific methods: keep them, plus 16 dwords behind arg[1] */
+                     if (readable(arg[1], 64)) { extra = 16; src = (const void*)arg[1]; } } break;
+        case 35:                                                 /* SetComputeRoot32BitConstants(root, n, data, offset): copy data */
+            if ((uint32_t)arg[1] <= 64 && readable(arg[2], (size_t)(uint32_t)arg[1] * 4)) { extra = (uint32_t)arg[1]; src = (const void*)arg[2]; }
+            rec = 1; break;
+        case 28 + 1000: break;
+        }
+        if (slot == 28 && (uint32_t)arg[0] <= 2 && readable(arg[1], 16)) { extra = (uint32_t)arg[0] * 2; src = (const void*)arg[1]; }   /* heap pointers */
+        if (rec) {
+            CmdRec* r = (CmdRec*)g_obj[id].meta;
+            if (!r) { r = (CmdRec*)calloc(1, sizeof(CmdRec)); g_obj[id].meta = r; }
+            size_t need = sizeof(RecHdr) + (size_t)extra * 4;
+            if (r && r->used + need > r->cap) { size_t nc = r->cap ? r->cap * 2 : 4096; while (nc < r->used + need) nc *= 2; uint8_t* nb = (uint8_t*)realloc(r->buf, nc); if (nb) { r->buf = nb; r->cap = nc; } }
+            if (r && r->buf && r->used + need <= r->cap) {
+                RecHdr* h = (RecHdr*)(r->buf + r->used); h->slot = (uint32_t)slot; h->nextra = extra;
+                for (int i = 0; i < 6; i++) h->a[i] = arg[i];
+                if (extra && src) memcpy(h + 1, src, (size_t)extra * 4);
+                r->used += need;
+            }
+        }
+    }
+    /* ---- ExecuteCommandLists(n, lists): walk recordings, log dispatches with their compute state ---- */
+    if (isqueue && !sret && slot == 35 && readable(arg[1], (size_t)(uint32_t)arg[0] * 8)) {
+        for (uint32_t li = 0; li < (uint32_t)arg[0] && li < 64; li++) replay_list(objid(((uint64_t*)arg[1])[li]));
     }
     if (isqueue && !sret && slot == 16) {                        /* Xbox queue Signal(fence, value): commands "finish" instantly */
         int f = objid(arg[0]);
