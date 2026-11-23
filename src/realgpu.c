@@ -326,14 +326,78 @@ static void run_queued(UINT bi, D3D12_CPU_DESCRIPTOR_HANDLE rtv, float sx, float
 }
 
 /* ---- translated shaders (RDNA2 -> HLSL -> DXIL by tools/xlat_all.py), loaded from GTA6_XLAT_DIR by hash ----
-   Root signature: param0 = root CBV b0 for the VS (32 user SGPRs + draw block), param1 = root CBV b1 for the PS,
-   param2 = root SRV t0 (pool page table); pool sections are reached through ResourceDescriptorHeap. */
+   Root signature: param0 = root CBV b0 for the VS, param1 = root CBV b1 for the PS (each: 32 user SGPRs, draw block,
+   8 texture bindings), param2 = root SRV t0 (pool page table); static sampler s0 (linear clamp).
+   Pool sections and cached render targets are reached through ResourceDescriptorHeap. */
 #define XPSO_MAX 8192
-typedef struct { uint64_t vh, ph; int topo; ID3D12PipelineState* pso; } XPso;
+#define STAGE_CB 512                                  /* bytes per stage block in the upload ring */
+typedef struct { uint64_t vh, ph; int topo; DXGI_FORMAT rtf; ID3D12PipelineState* pso; } XPso;
 static XPso g_xpsos[XPSO_MAX]; static int g_nxpsos;
 static ID3D12RootSignature* g_xrs;
-typedef struct { ID3D12PipelineState* pso; uint32_t vsc[36], psc[36]; uint32_t verts, insts; int prim; float vp[6]; } XDraw;
-static XDraw* g_xq; static int g_nxq, g_capxq;
+/* ---- render target cache: game render targets (by address) -> real D3D12 textures with RTV + bindless SRV ---- */
+#define RT_MAX 256
+#define RT_SRV0 256                                   /* descriptor index of cache entry 0 (0..255 = pool sections) */
+typedef struct { uint64_t addr; UINT w, h; DXGI_FORMAT fmt; ID3D12Resource* tex; D3D12_RESOURCE_STATES st; int drawn; } RtEnt;
+static RtEnt g_rt[RT_MAX]; static volatile LONG g_nrt; static SRWLOCK g_rtlk = SRWLOCK_INIT;
+static ID3D12DescriptorHeap* g_rtvh; static UINT g_rtvhinc;
+static DXGI_FORMAT rt_typed(DXGI_FORMAT f) {          /* render-target-capable variant of typeless formats */
+    switch (f) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_FLOAT;
+    case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
+    case DXGI_FORMAT_R8G8_TYPELESS: return DXGI_FORMAT_R8G8_UNORM;
+    default: return f;
+    }
+}
+/* find or create the cached texture for a game render target; -1 if the format can't be a colour target */
+int rg_rt(uint64_t addr, UINT w, UINT h, UINT fmt) {
+    if (g_state != 1 || !addr || !w || !h || w > 16384 || h > 16384) return -1;
+    DXGI_FORMAT f = rt_typed((DXGI_FORMAT)fmt);
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = { f };
+    for (int i = 0; i < g_nrt; i++) if (g_rt[i].addr == addr && g_rt[i].w == w && g_rt[i].h == h && g_rt[i].fmt == f) return i;
+    if (FAILED(ID3D12Device_CheckFeatureSupport(g_dev, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) || !(fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
+        static int nl; if (nl++ < 10) rlog("rt cache: format %u (%u) is not a colour render target, skipped", fmt, f); return -1; }
+    AcquireSRWLockExclusive(&g_rtlk);
+    int idx = -1;
+    for (int i = 0; i < g_nrt; i++) if (g_rt[i].addr == addr && g_rt[i].w == w && g_rt[i].h == h && g_rt[i].fmt == f) { idx = i; break; }
+    if (idx < 0 && g_nrt < RT_MAX && g_srvheap) {
+        if (!g_rtvh) { D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, RT_MAX };
+            ID3D12Device_CreateDescriptorHeap(g_dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&g_rtvh); g_rtvhinc = ID3D12Device_GetDescriptorHandleIncrementSize(g_dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV); }
+        D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1, f, { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET };
+        D3D12_CLEAR_VALUE cv = { f, { 0, 0, 0, 0 } };
+        ID3D12Resource* tex = NULL;
+        HRESULT hr = ID3D12Device_CreateCommittedResource(g_dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, &IID_ID3D12Resource, (void**)&tex);
+        if (SUCCEEDED(hr) && g_rtvh) {
+            int i = g_nrt; RtEnt* e = &g_rt[i]; e->addr = addr; e->w = w; e->h = h; e->fmt = f; e->tex = tex; e->st = D3D12_RESOURCE_STATE_RENDER_TARGET; e->drawn = 0;
+            D3D12_CPU_DESCRIPTOR_HANDLE rh; ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(g_rtvh, &rh); rh.ptr += (SIZE_T)i * g_rtvhinc;
+            ID3D12Device_CreateRenderTargetView(g_dev, tex, NULL, rh);
+            D3D12_CPU_DESCRIPTOR_HANDLE sh; ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(g_srvheap, &sh); sh.ptr += (SIZE_T)(RT_SRV0 + i) * g_srvinc;
+            ID3D12Device_CreateShaderResourceView(g_dev, tex, NULL, sh);
+            InterlockedIncrement(&g_nrt); idx = i;
+            rlog("rt cache #%d: game render target %llX %ux%u format %u", i, addr, w, h, f);
+        } else rlog("rt cache: texture %ux%u format %u failed 0x%08lX", w, h, f, hr);
+    }
+    ReleaseSRWLockExclusive(&g_rtlk);
+    return idx;
+}
+/* resolve a texture address the game samples: cached render target -> descriptor index, else -1 */
+int rg_rt_srv(uint64_t addr) { for (int i = 0; i < g_nrt; i++) if (g_rt[i].addr == addr) return RT_SRV0 + i; return -1; }
+static D3D12_CPU_DESCRIPTOR_HANDLE rt_rtv(int i) { D3D12_CPU_DESCRIPTOR_HANDLE h; ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(g_rtvh, &h); h.ptr += (SIZE_T)i * g_rtvhinc; return h; }
+static void rt_state(int i, D3D12_RESOURCE_STATES want) {
+    if (i < 0 || i >= g_nrt || g_rt[i].st == want) return;
+    D3D12_RESOURCE_BARRIER b = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION }; b.Transition.pResource = g_rt[i].tex; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = g_rt[i].st; b.Transition.StateAfter = want; ID3D12GraphicsCommandList_ResourceBarrier(g_list, 1, &b); g_rt[i].st = want;
+}
+/* ordered per-frame operations: draws and clears, in the game's order */
+typedef struct { int kind; ID3D12PipelineState* pso; uint32_t vsc[68], psc[68]; uint32_t verts, insts; int prim; float vp[6]; int rt; float clear[4]; } XDraw;
+static XDraw* g_xq; static int g_nxq, g_capxq; static SRWLOCK g_xqlk = SRWLOCK_INIT;
 static void* load_file(const char* path, size_t* len) {
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL); if (f == INVALID_HANDLE_VALUE) return NULL;
     DWORD sz = GetFileSize(f, NULL), rd = 0; void* p = malloc(sz ? sz : 1); if (p && !ReadFile(f, p, sz, &rd, NULL)) { free(p); p = NULL; }
@@ -349,28 +413,31 @@ static void note_needed(uint64_t vh, uint64_t ph) {
     HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, 0, NULL);
     if (f != INVALID_HANDLE_VALUE) { char l[64]; int k = snprintf(l, sizeof l, "%016llX %016llX\r\n", vh, ph); DWORD w; WriteFile(f, l, k, &w, NULL); CloseHandle(f); }
 }
-/* topo: D3D_PRIMITIVE_TOPOLOGY value; only triangle lists/strips are drawn for now */
-static ID3D12PipelineState* get_xpso(uint64_t vh, uint64_t ph, int topo) {
+static int make_xrs(void) {
+    if (g_xrs) return 1;
+    D3D12_ROOT_PARAMETER1 p[3] = { 0 };
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0; p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 1; p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    p[0].Descriptor.Flags = p[1].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
+    p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_STATIC_SAMPLER_DESC ss = { D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        0, 1, D3D12_COMPARISON_FUNC_NEVER, D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK, 0, D3D12_FLOAT32_MAX, 0, 0, D3D12_SHADER_VISIBILITY_ALL };
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC rd = { D3D_ROOT_SIGNATURE_VERSION_1_1 };
+    rd.Desc_1_1.NumParameters = 3; rd.Desc_1_1.pParameters = p; rd.Desc_1_1.NumStaticSamplers = 1; rd.Desc_1_1.pStaticSamplers = &ss;
+    rd.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+    ID3DBlob *blob = NULL, *err = NULL;
+    if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &blob, &err))) { rlog("translated root signature serialize failed: %s", err ? (char*)ID3D10Blob_GetBufferPointer(err) : "?"); return 0; }
+    HRESULT hr = ID3D12Device_CreateRootSignature(g_dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void**)&g_xrs);
+    ID3D10Blob_Release(blob); if (FAILED(hr)) { rlog("translated root signature failed 0x%08lX", hr); return 0; }
+    return 1;
+}
+/* topo: D3D_PRIMITIVE_TOPOLOGY value; rtf: render target format (back buffer when drawing without the cache) */
+static ID3D12PipelineState* get_xpso(uint64_t vh, uint64_t ph, int topo, DXGI_FORMAT rtf) {
     int tt = (topo == 1) ? 1 : (topo == 2 || topo == 3) ? 2 : 3;      /* point, line, triangle */
-    for (int i = 0; i < g_nxpsos; i++) if (g_xpsos[i].vh == vh && g_xpsos[i].ph == ph && g_xpsos[i].topo == tt) return g_xpsos[i].pso;
+    for (int i = 0; i < g_nxpsos; i++) if (g_xpsos[i].vh == vh && g_xpsos[i].ph == ph && g_xpsos[i].topo == tt && g_xpsos[i].rtf == rtf) return g_xpsos[i].pso;
     if (g_nxpsos >= XPSO_MAX) return NULL;
-    XPso* e = &g_xpsos[g_nxpsos++]; e->vh = vh; e->ph = ph; e->topo = tt; e->pso = NULL;
-    char dir[MAX_PATH]; if (!GetEnvironmentVariableA("GTA6_XLAT_DIR", dir, MAX_PATH)) return NULL;
-    if (!g_xrs) {
-        D3D12_ROOT_PARAMETER1 p[3] = { 0 };
-        /* 36 dwords per stage do not fit as root constants (64-dword limit): root CBVs into a per-frame upload ring */
-        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0; p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 1; p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        p[0].Descriptor.Flags = p[1].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
-        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; p[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_VERSIONED_ROOT_SIGNATURE_DESC rd = { D3D_ROOT_SIGNATURE_VERSION_1_1 };
-        rd.Desc_1_1.NumParameters = 3; rd.Desc_1_1.pParameters = p;
-        rd.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
-        ID3DBlob *blob = NULL, *err = NULL;
-        if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &blob, &err))) { rlog("translated root signature serialize failed: %s", err ? (char*)ID3D10Blob_GetBufferPointer(err) : "?"); return NULL; }
-        HRESULT hr = ID3D12Device_CreateRootSignature(g_dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void**)&g_xrs);
-        ID3D10Blob_Release(blob); if (FAILED(hr)) { rlog("translated root signature failed 0x%08lX", hr); return NULL; }
-    }
+    XPso* e = &g_xpsos[g_nxpsos++]; e->vh = vh; e->ph = ph; e->topo = tt; e->rtf = rtf; e->pso = NULL;
+    char dir[MAX_PATH]; if (!GetEnvironmentVariableA("GTA6_XLAT_DIR", dir, MAX_PATH) || !make_xrs()) return NULL;
     char pv[MAX_PATH], pp[MAX_PATH]; size_t lv = 0, lp = 0;
     snprintf(pv, sizeof pv, "%s\\%016llX.vs.cso", dir, vh); snprintf(pp, sizeof pp, "%s\\%016llX.ps.cso", dir, ph);
     void* vs = load_file(pv, &lv); void* ps = load_file(pp, &lp);
@@ -382,25 +449,55 @@ static ID3D12PipelineState* get_xpso(uint64_t vh, uint64_t ph, int topo) {
     d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL; d.SampleMask = 0xFFFFFFFF;
     d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; d.RasterizerState.DepthClipEnable = TRUE;
     d.PrimitiveTopologyType = tt == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT : tt == 2 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    d.NumRenderTargets = 1; d.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+    d.NumRenderTargets = 1; d.RTVFormats[0] = rtf; d.SampleDesc.Count = 1;
     HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(g_dev, &d, &IID_ID3D12PipelineState, (void**)&e->pso);
-    static int nl; if (nl++ < 40 || FAILED(hr)) rlog("pipeline from TRANSLATED shaders vs %016llX + ps %016llX: %s 0x%08lX", vh, ph, SUCCEEDED(hr) ? "OK" : "FAILED", hr);
+    static int nl; if (nl++ < 40 || FAILED(hr)) rlog("pipeline from TRANSLATED shaders vs %016llX + ps %016llX (rt format %u): %s 0x%08lX", vh, ph, rtf, SUCCEEDED(hr) ? "OK" : "FAILED", hr);
     free(vs); free(ps);
     return e->pso;
 }
-/* vsc/psc: 36 constants each (32 user SGPRs + index buffer lo/hi, flags, spare); prim = D3D_PRIMITIVE_TOPOLOGY */
-void rg_queue_xlat_draw(uint64_t vh, uint64_t ph, const uint32_t* vsc, const uint32_t* psc, uint32_t verts, uint32_t insts, int prim, const float* vp) {
+static XDraw* xq_add(void) {
+    if (g_nxq == g_capxq) { int nc = g_capxq ? g_capxq * 2 : 256; XDraw* n = (XDraw*)realloc(g_xq, sizeof(XDraw) * nc); if (!n) return NULL; g_xq = n; g_capxq = nc; }
+    return &g_xq[g_nxq++];
+}
+/* vsc/psc: 68 constants each (32 user SGPRs, index buffer lo/hi + flags + spare, 8 x texture binding {addr lo, addr hi, srv, 0});
+   rt: render target cache index (-1 = draw onto the back buffer, scaled from 3840x2160) */
+void rg_queue_xlat_draw(uint64_t vh, uint64_t ph, const uint32_t* vsc, const uint32_t* psc, uint32_t verts, uint32_t insts, int prim, const float* vp, int rt) {
     if (g_state != 1) return;
     static int maxd = -1; if (maxd < 0) { char b[16]; maxd = GetEnvironmentVariableA("GTA6_XLAT_MAXDRAWS", b, sizeof b) ? atoi(b) : 4000; }
     if (g_nxq >= maxd) return;
-    ID3D12PipelineState* pso = get_xpso(vh, ph, prim); if (!pso) return;
-    if (g_nxq == g_capxq) { int nc = g_capxq ? g_capxq * 2 : 256; XDraw* n = (XDraw*)realloc(g_xq, sizeof(XDraw) * nc); if (!n) return; g_xq = n; g_capxq = nc; }
-    XDraw* q = &g_xq[g_nxq++]; q->pso = pso; memcpy(q->vsc, vsc, sizeof q->vsc); memcpy(q->psc, psc, sizeof q->psc);
-    q->verts = verts; q->insts = insts; q->prim = prim; memcpy(q->vp, vp, sizeof q->vp);
+    DXGI_FORMAT rtf = (rt >= 0 && rt < g_nrt) ? g_rt[rt].fmt : DXGI_FORMAT_B8G8R8A8_UNORM;
+    ID3D12PipelineState* pso = get_xpso(vh, ph, prim, rtf); if (!pso) return;
+    AcquireSRWLockExclusive(&g_xqlk);
+    XDraw* q = xq_add();
+    if (q) { q->kind = 0; q->pso = pso; memcpy(q->vsc, vsc, sizeof q->vsc); memcpy(q->psc, psc, sizeof q->psc);
+             q->verts = verts; q->insts = insts; q->prim = prim; memcpy(q->vp, vp, sizeof q->vp); q->rt = rt; }
+    ReleaseSRWLockExclusive(&g_xqlk);
 }
-static void run_xlat(UINT bi, D3D12_CPU_DESCRIPTOR_HANDLE rtv, float sx, float sy) {
-    if (!g_nxq) return;
-    if (!g_ptab || !g_srvheap || !g_xrs) { g_nxq = 0; return; }
+void rg_queue_clear(int rt, const float* rgba) {
+    if (g_state != 1 || rt < 0) return;
+    AcquireSRWLockExclusive(&g_xqlk);
+    XDraw* q = xq_add(); if (q) { q->kind = 1; q->rt = rt; memcpy(q->clear, rgba, 16); }
+    ReleaseSRWLockExclusive(&g_xqlk);
+}
+static ID3D12PipelineState* g_blitpso;
+/* present blit pipeline: tools/blit.hlsl (bin/blit_vs.cso + blit_ps.cso, folder in GTA6_BLIT_DIR); PS constants at b1 */
+static void build_blit(void) {
+    static int tried; if (tried++) return;
+    char vsP[MAX_PATH], psP[MAX_PATH]; size_t lv = 0, lp = 0; void *vs = NULL, *ps = NULL;
+    if (GetEnvironmentVariableA("GTA6_BLIT_DIR", vsP, MAX_PATH - 20)) { strcpy(psP, vsP); strcat(vsP, "\\blit_vs.cso"); strcat(psP, "\\blit_ps.cso"); vs = load_file(vsP, &lv); ps = load_file(psP, &lp); }
+    if (!vs || !ps || !make_xrs()) { rlog("present blit: GTA6_BLIT_DIR (blit_vs.cso / blit_ps.cso) not available"); free(vs); free(ps); return; }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = { 0 };
+    d.pRootSignature = g_xrs; d.VS.pShaderBytecode = vs; d.VS.BytecodeLength = lv; d.PS.pShaderBytecode = ps; d.PS.BytecodeLength = lp;
+    d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL; d.SampleMask = 0xFFFFFFFF;
+    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; d.NumRenderTargets = 1; d.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+    HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(g_dev, &d, &IID_ID3D12PipelineState, (void**)&g_blitpso);
+    free(vs); free(ps); if (FAILED(hr)) rlog("present blit pipeline failed 0x%08lX", hr);
+}
+static uint64_t g_presaddr;                            /* address of the render target the game presents this frame */
+void rg_set_present(uint64_t addr) { g_presaddr = addr; }
+static void run_xlat(UINT bi, D3D12_CPU_DESCRIPTOR_HANDLE bbrtv, float sx, float sy, UINT bw, UINT bh) {
+    if (!g_ptab || !g_srvheap || !make_xrs()) { g_nxq = 0; return; }
     if (!g_upload[bi]) {
         D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_UPLOAD };
         D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, UPLOAD_SIZE, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
@@ -408,28 +505,58 @@ static void run_xlat(UINT bi, D3D12_CPU_DESCRIPTOR_HANDLE rtv, float sx, float s
         ID3D12Resource_Map(g_upload[bi], 0, NULL, (void**)&g_upmap[bi]);
     }
     D3D12_GPU_VIRTUAL_ADDRESS ub = ID3D12Resource_GetGPUVirtualAddress(g_upload[bi]); size_t off = 0;
-    ID3D12GraphicsCommandList_OMSetRenderTargets(g_list, 1, &rtv, FALSE, NULL);
     ID3D12GraphicsCommandList_SetDescriptorHeaps(g_list, 1, &g_srvheap);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(g_list, g_xrs);
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(g_list, 2, ID3D12Resource_GetGPUVirtualAddress(g_ptab));
-    int lastprim = -1;
+    AcquireSRWLockExclusive(&g_xqlk);
+    int lastprim = -1, currt = -2, ndraw = 0, nclear = 0;
     for (int i = 0; i < g_nxq; i++) {
         XDraw* q = &g_xq[i];
-        D3D12_VIEWPORT v = { q->vp[0] * sx, q->vp[1] * sy, q->vp[2] * sx, q->vp[3] * sy, q->vp[4], q->vp[5] };
+        if (q->kind == 1) {                                       /* clear a cached render target */
+            if (q->rt < 0 || q->rt >= g_nrt) continue;
+            rt_state(q->rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            ID3D12GraphicsCommandList_ClearRenderTargetView(g_list, rt_rtv(q->rt), q->clear, 0, NULL); nclear++;
+            continue;
+        }
+        if (off + 2 * STAGE_CB > UPLOAD_SIZE) break;
+        /* textures this draw samples must be readable; its own target writable */
+        for (int t = 0; t < 8; t++) { uint32_t s = q->psc[36 + t * 4 + 2]; if (s >= RT_SRV0 && s < RT_SRV0 + (uint32_t)g_nrt && (int)(s - RT_SRV0) != q->rt) rt_state((int)(s - RT_SRV0), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); }
+        if (q->rt != currt || (q->rt >= 0 && g_rt[q->rt].st != D3D12_RESOURCE_STATE_RENDER_TARGET)) {
+            if (q->rt >= 0 && q->rt < g_nrt) { rt_state(q->rt, D3D12_RESOURCE_STATE_RENDER_TARGET); D3D12_CPU_DESCRIPTOR_HANDLE h = rt_rtv(q->rt); ID3D12GraphicsCommandList_OMSetRenderTargets(g_list, 1, &h, FALSE, NULL); g_rt[q->rt].drawn = 1; }
+            else ID3D12GraphicsCommandList_OMSetRenderTargets(g_list, 1, &bbrtv, FALSE, NULL);
+            currt = q->rt;
+        }
+        float ax = (q->rt >= 0) ? 1.0f : sx, ay = (q->rt >= 0) ? 1.0f : sy;
+        D3D12_VIEWPORT v = { q->vp[0] * ax, q->vp[1] * ay, q->vp[2] * ax, q->vp[3] * ay, q->vp[4], q->vp[5] };
         D3D12_RECT sc = { (LONG)v.TopLeftX, (LONG)v.TopLeftY, (LONG)(v.TopLeftX + v.Width), (LONG)(v.TopLeftY + v.Height) };
         ID3D12GraphicsCommandList_RSSetViewports(g_list, 1, &v); ID3D12GraphicsCommandList_RSSetScissorRects(g_list, 1, &sc);
         if (q->prim != lastprim) { ID3D12GraphicsCommandList_IASetPrimitiveTopology(g_list, (D3D_PRIMITIVE_TOPOLOGY)(q->prim ? q->prim : 4)); lastprim = q->prim; }
         ID3D12GraphicsCommandList_SetPipelineState(g_list, q->pso);
-        if (off + 512 > UPLOAD_SIZE) break;
-        memcpy(g_upmap[bi] + off, q->vsc, sizeof q->vsc); memcpy(g_upmap[bi] + off + 256, q->psc, sizeof q->psc);
+        memcpy(g_upmap[bi] + off, q->vsc, sizeof q->vsc); memcpy(g_upmap[bi] + off + STAGE_CB, q->psc, sizeof q->psc);
         ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(g_list, 0, ub + off);
-        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(g_list, 1, ub + off + 256);
-        off += 512;
-        ID3D12GraphicsCommandList_DrawInstanced(g_list, q->verts, q->insts ? q->insts : 1, 0, 0);
+        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(g_list, 1, ub + off + STAGE_CB);
+        off += 2 * STAGE_CB;
+        ID3D12GraphicsCommandList_DrawInstanced(g_list, q->verts, q->insts ? q->insts : 1, 0, 0); ndraw++;
+    }
+    g_nxq = 0;
+    ReleaseSRWLockExclusive(&g_xqlk);
+    /* show the presented render target, scaled to the window */
+    int prt = -1; for (int i = 0; i < g_nrt; i++) if (g_rt[i].addr == g_presaddr && g_rt[i].drawn) { prt = i; break; }
+    if (prt >= 0) build_blit();
+    if (prt >= 0 && g_blitpso && off + 2 * STAGE_CB <= UPLOAD_SIZE) {
+        rt_state(prt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        ID3D12GraphicsCommandList_OMSetRenderTargets(g_list, 1, &bbrtv, FALSE, NULL);
+        D3D12_VIEWPORT v = { 0, 0, (float)bw, (float)bh, 0, 1 }; D3D12_RECT sc = { 0, 0, (LONG)bw, (LONG)bh };
+        ID3D12GraphicsCommandList_RSSetViewports(g_list, 1, &v); ID3D12GraphicsCommandList_RSSetScissorRects(g_list, 1, &sc);
+        ID3D12GraphicsCommandList_SetPipelineState(g_list, g_blitpso);
+        ID3D12GraphicsCommandList_IASetPrimitiveTopology(g_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        uint32_t* c = (uint32_t*)(g_upmap[bi] + off); memset(c, 0, 2 * STAGE_CB); c[0] = (uint32_t)(RT_SRV0 + prt);
+        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(g_list, 0, ub + off);      /* the blit VS uses no constants */
+        ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(g_list, 1, ub + off);      /* blit PS: g_srv at b1 */
+        ID3D12GraphicsCommandList_DrawInstanced(g_list, 3, 1, 0, 0);
     }
     static int logged; static ULONGLONG last; ULONGLONG now = GetTickCount64();
-    if (logged < 3 || now - last > 5000) { logged++; last = now; rlog("frame ran %d draws with TRANSLATED game shaders on the real GPU (pipelines cached: %d)", g_nxq, g_nxpsos); }
-    g_nxq = 0;
+    if (logged < 3 || now - last > 5000) { logged++; last = now; rlog("frame: %d translated draws, %d clears, %d cached render targets, presented %s", ndraw, nclear, g_nrt, prt >= 0 ? "a cached render target" : "the back buffer"); }
 }
 
 /* Clear the next back buffer to rgba and present it (sync interval 0: pacing is done by the caller). */
@@ -448,7 +575,7 @@ int rg_present_clear(const float* rgba) {
     ID3D12GraphicsCommandList_ClearRenderTargetView(g_list, h, rgba, 0, NULL);
     { D3D12_RESOURCE_DESC bd; ID3D12Resource_GetDesc(g_bb[i], &bd);
       run_queued(i, h, (float)bd.Width / 3840.0f, (float)bd.Height / 2160.0f);
-      run_xlat(i, h, (float)bd.Width / 3840.0f, (float)bd.Height / 2160.0f); }
+      run_xlat(i, h, (float)bd.Width / 3840.0f, (float)bd.Height / 2160.0f, (UINT)bd.Width, bd.Height); }
     /* readback: the centre pixel a few times, and with GTA6_SHOT=1 full frames (600, 1500, 3000, 4500) -> <logs>\shot_<frame>.bmp */
     static ID3D12Resource* rb; static UINT64 rbsize; static int rbcount; static int shots = -1;
     if (shots < 0) shots = GetEnvironmentVariableA("GTA6_SHOT", NULL, 0) ? 1 : 0;

@@ -89,7 +89,11 @@ typedef struct { void* p; int parent, slot, kind; GUID iid; void* aux; void* met
    Pipeline objects keep meta = PsoMeta (shader code, size, hash, copy of the creation desc). */
 typedef struct { int n; uint8_t kind[64]; uint16_t val[64]; } RootLayout;   /* root signature parameters (rg_rootsig_info) */
 typedef struct { uint64_t code, size, hash; uint8_t desc[0x180]; uint32_t regs[7]; int hasregs; const void* vs; const void* ps; size_t vslen, pslen; uint64_t vhash, phash; } PsoMeta;
-void rg_queue_xlat_draw(uint64_t vh, uint64_t ph, const uint32_t* vsc, const uint32_t* psc, uint32_t verts, uint32_t insts, int prim, const float* vp);
+void rg_queue_xlat_draw(uint64_t vh, uint64_t ph, const uint32_t* vsc, const uint32_t* psc, uint32_t verts, uint32_t insts, int prim, const float* vp, int rt);
+int rg_rt(uint64_t addr, unsigned w, unsigned h, unsigned fmt);
+int rg_rt_srv(uint64_t addr);
+void rg_queue_clear(int rt, const float* rgba);
+void rg_set_present(uint64_t addr);
 void rg_queue_dxil_draw(const void* vs, size_t vslen, const void* ps, size_t pslen, const void* srv, uint32_t srvlen, uint32_t verts, uint32_t insts, const float* vp);
 typedef struct { uint8_t* buf; size_t used, cap; } CmdRec;
 /* Resources keep meta = ResMeta (their D3D12_RESOURCE_DESC); memory stays in aux. */
@@ -238,6 +242,27 @@ static uint64_t heap_lowgpu(int id) {
     ReleaseSRWLockExclusive(&lk);
     return g_heaplow[id];
 }
+static uint64_t gpu2cpu(uint64_t a);
+/* cached render target index for an RTV handle: its resource's memory address, size and DXGI format (from the desc) */
+static int rt_for_handle(uint64_t handle) {
+    int ro = rtv_get(handle); if (ro <= 0 || !g_obj[ro].aux) return -1;
+    ResMeta* rm = (g_obj[ro].iid.Data1 == 0x696442BE) ? (ResMeta*)g_obj[ro].meta : NULL; if (!rm) return -1;
+    uint64_t w = *(uint64_t*)(rm->desc + 16); uint32_t h = *(uint32_t*)(rm->desc + 24), fmt = *(uint32_t*)(rm->desc + 32);
+    return rg_rt((uint64_t)g_obj[ro].aux, (unsigned)w, h, fmt);
+}
+/* the textures a draw can sample: image descriptors (T#, type 8..15) among the first 16 entries of root table 0, each
+   resolved to a cached render target -> up to 8 bindings {address lo, address hi, descriptor index, 0} at cb[36..67] */
+static void tex_bindings(uint64_t table, uint32_t* cb) {
+    uint64_t c = gpu2cpu(table); int n = 0;
+    if (!table || !readable(c, 16 * 32)) return;
+    for (int e = 0; e < 16 && n < 8; e++) {
+        const uint32_t* d = (const uint32_t*)(c + (uint64_t)e * 32); uint32_t type = d[3] >> 28;
+        if (type < 8) continue;
+        uint64_t base = ((uint64_t)d[0] | ((uint64_t)(d[1] & 0xFF) << 32)) << 8;
+        int s = rg_rt_srv(base); if (s < 0) continue;
+        cb[36 + n * 4] = (uint32_t)base; cb[37 + n * 4] = (uint32_t)(base >> 32); cb[38 + n * 4] = (uint32_t)s; cb[39 + n * 4] = 0; n++;
+    }
+}
 /* Vertex buffer descriptor table for a main-renderer draw: one 16-byte AMD buffer descriptor (V#) per IA slot, built
    from the recorded IASetVertexBuffers views {address, size, stride} in a GPU-visible scratch ring (xmem_gpu_scratch). */
 static uint8_t* vb_table(uint32_t vb[32][4]) {
@@ -372,12 +397,14 @@ static void emu_try_dispatch(PsoMeta* m, const uint64_t* tables, const RecHdr* h
 }
 /* Walk one recorded command list, tracking compute state; log each new (shader, dispatch) combination once.
    This is where the interpreter will execute dispatches. */
+static int g_xlat_on = -1;                                      /* GTA6_XLAT_DIR set: translated draws on the real GPU */
 static void replay_list(int lid) {
+    if (g_xlat_on < 0) g_xlat_on = GetEnvironmentVariableA("GTA6_XLAT_DIR", NULL, 0) ? 1 : 0;
     if (lid <= 0 || !g_obj[lid].meta) return;
     CmdRec* r = (CmdRec*)g_obj[lid].meta;
     int pso = -1, rootsig = -1; uint64_t tables[16] = { 0 }, views[16] = { 0 }, heaps[2] = { 0 }; uint32_t consts[16][64]; uint32_t cmask[16] = { 0 };
     float gvp[6] = { 0, 0, 3840, 2160, 0, 1 }; uint64_t groot0 = 0;
-    int gprim = 4; int grs = -1; uint64_t gtab[16] = { 0 }, gview[16] = { 0 }; uint32_t gconst[16][64] = { 0 }; uint32_t gib[4] = { 0 }; uint32_t gvb[32][4] = { 0 };   /* graphics root + IA state */
+    int gprim = 4, grt = -1; int grs = -1; uint64_t gtab[16] = { 0 }, gview[16] = { 0 }; uint32_t gconst[16][64] = { 0 }; uint32_t gib[4] = { 0 }; uint32_t gvb[32][4] = { 0 };   /* graphics root + IA state */
     static volatile LONG logged; static uint64_t seen[4096]; static LONG nseen;
     for (size_t off = 0; off + sizeof(RecHdr) <= r->used;) {
         RecHdr* h = (RecHdr*)(r->buf + off); const uint32_t* ex = (const uint32_t*)(h + 1);
@@ -413,7 +440,9 @@ static void replay_list(int lid) {
                 }
             }
         }
-        if (h->slot == 52 && h->nextra == 4) { int rr = rtv_get(h->a[0]); if (rr > 0) clear_set(rr, (const float*)ex); }
+        if (h->slot == 52 && h->nextra == 4) { int rr = rtv_get(h->a[0]); if (rr > 0) clear_set(rr, (const float*)ex);
+            if (g_xlat_on) rg_queue_clear(rt_for_handle(h->a[0]), (const float*)ex); }
+        if (h->slot == 50 && h->nextra == 2 && g_xlat_on) grt = rt_for_handle(*(const uint64_t*)ex);      /* OMSetRenderTargets: first colour target */
         /* graphics state for real-GPU draws */
         if (h->slot == 21 && h->nextra == 6) memcpy(gvp, ex, 24);
         if (h->slot == 44 && h->a[0] == 0) groot0 = h->a[1];                      /* Xbox: SetGraphicsRootShaderResourceView(0, va) */
@@ -425,6 +454,15 @@ static void replay_list(int lid) {
                 dlog("DRAWLOG   tables %llX %llX %llX %llX  views %llX %llX  consts1 %08X %08X  ib %08X%08X size %X fmt %X",
                     gtab[0], gtab[1], gtab[2], gtab[3], gview[0], gview[1], gconst[1][0], gconst[1][1], gib[1], gib[0], gib[2], gib[3]);
                 for (int v = 0; v < 4; v++) if (gvb[v][0] || gvb[v][1]) dlog("DRAWLOG   vb%d addr %08X%08X size %X stride %X", v, gvb[v][1], gvb[v][0], gvb[v][2], gvb[v][3]);
+                {   /* every image descriptor (T#) among the first 16 entries of table 0, decoded */
+                    uint64_t c = gpu2cpu(gtab[0]);
+                    if (gtab[0] && readable(c, 16 * 32)) for (int e = 0; e < 16; e++) {
+                        const uint32_t* d = (const uint32_t*)(c + (uint64_t)e * 32); uint32_t type = d[3] >> 28; if (type < 8) continue;
+                        uint64_t tb = ((uint64_t)d[0] | ((uint64_t)(d[1] & 0xFF) << 32)) << 8;
+                        dlog("DRAWLOG   tex entry %d: base %llX %ux%u fmt %u type %u swizzle %u mips %u depth %u%s", e, tb, (d[2] & 0x3FFF) + 1, ((d[2] >> 14) & 0x3FFF) + 1,
+                            (d[1] >> 20) & 0x1FF, type, (d[3] >> 20) & 31, ((d[3] >> 16) & 15) + 1, (d[4] & 0x1FFF) + 1, rg_rt_srv(tb) >= 0 ? "  [cached render target]" : "");
+                    }
+                }
                 {   /* once: raw dump of the first linear 2D texture in table 0 (T# at +0x20) -> <logs>\tex_<w>x<h>_f<fmt>.raw */
                     static volatile LONG dumped; uint64_t c = gpu2cpu(gtab[0]);
                     if (gtab[0] && readable(c + 0x20, 32)) {
@@ -454,13 +492,12 @@ static void replay_list(int lid) {
         if ((h->slot == 12 || h->slot == 13) && pso > 0) {
             PsoMeta* gm = (PsoMeta*)g_obj[pso].meta;
             /* translated path: the game's RDNA2 shaders, translated offline to DXIL (tools/xlat_all.py), keyed by code hash */
-            static int xl = -1; if (xl < 0) xl = GetEnvironmentVariableA("GTA6_XLAT_DIR", NULL, 0) ? 1 : 0;
-            if (xl && gm && gm->vs && gm->ps) {
+            if (g_xlat_on && gm && gm->vs && gm->ps) {
                 if (!gm->vhash) { uint64_t a = 1469598103934665603ull, b = a;
                     for (size_t i = 0; i < gm->vslen; i++) { a ^= ((const uint8_t*)gm->vs)[i]; a *= 1099511628211ull; }
                     for (size_t i = 0; i < gm->pslen; i++) { b ^= ((const uint8_t*)gm->ps)[i]; b *= 1099511628211ull; }
                     gm->vhash = a; gm->phash = b; }
-                uint32_t vsc[36] = { 0 }, psc[36] = { 0 }; int indexed = (h->slot == 13); int ok = 1;
+                uint32_t vsc[68] = { 0 }, psc[68] = { 0 }; int indexed = (h->slot == 13); int ok = 1;
                 if (g_obj[pso].slot == 57) {
                     /* main renderer: s[0:1] = vertex buffer descriptor table (40-bit), s2 = base vertex, s3 = start instance,
                        s8 = low 32 bits of root table 0 (the title's per-draw table of AMD descriptors, below 4 GB) */
@@ -469,6 +506,7 @@ static void replay_list(int lid) {
                     else { vsc[0] = (uint32_t)(uint64_t)tbl; vsc[1] = (uint32_t)((uint64_t)tbl >> 32) & 0xFF; }
                     vsc[2] = (uint32_t)(indexed ? h->a[3] : h->a[2]); vsc[3] = (uint32_t)(indexed ? h->a[4] : h->a[3]);
                     vsc[8] = psc[8] = (uint32_t)gtab[0];
+                    tex_bindings(gtab[0], psc); tex_bindings(gtab[0], vsc);
                     if (indexed) {                                        /* index buffer view {address, size, format}; 42 = R32_UINT */
                         uint64_t ib = ((uint64_t)gib[1] << 32) | gib[0]; int i32 = (gib[3] == 42);
                         ib += (uint64_t)(uint32_t)h->a[2] * (i32 ? 4 : 2);
@@ -480,7 +518,7 @@ static void replay_list(int lid) {
                     vsc[8] = (uint32_t)groot0; vsc[9] = (uint32_t)(groot0 >> 32);
                     if (!groot0) ok = 0;
                 }
-                if (ok) rg_queue_xlat_draw(gm->vhash, gm->phash, vsc, psc, (uint32_t)h->a[0], (uint32_t)h->a[1], gprim, gvp);
+                if (ok) rg_queue_xlat_draw(gm->vhash, gm->phash, vsc, psc, (uint32_t)h->a[0], (uint32_t)h->a[1], gprim, gvp, g_obj[pso].slot == 57 ? grt : -1);
             }
             /* off by default: the exe's "DXIL" shaders are shells (NOBC) - the PC driver can't compile them */
             static int trydxil = -1; if (trydxil < 0) trydxil = GetEnvironmentVariableA("GTA6_TRY_DXIL", NULL, 0) ? 1 : 0;
@@ -901,6 +939,7 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
             static int usegdi = -1; if (usegdi < 0) usegdi = GetEnvironmentVariableA("GTA6_GDI", NULL, 0) ? 1 : 0;
             if (!usegdi && rg_init(FindWindowA(NULL, "Americas"))) {
                 const float* c = ro > 0 ? clear_get(ro) : NULL; static const float black[4] = { 0, 0, 0, 1 };
+                rg_set_present(ro > 0 ? (uint64_t)g_obj[ro].aux : 0);
                 rg_present_clear(c ? c : black);
                 static volatile LONG cl; if (c && InterlockedIncrement(&cl) <= 5) dlog("present: back buffer obj#%d last cleared to %.3f %.3f %.3f %.3f", ro, c[0], c[1], c[2], c[3]);
             } else if (ro > 0) show_frame(g_obj[ro].aux, w, h, k);
