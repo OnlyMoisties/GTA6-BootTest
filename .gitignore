@@ -14,3 +14,6 @@ __pycache__/
 *.xvd
 *.exe
 *.dll
+
+# downloaded vendor specs (not ours to redistribute)
+third_party/
