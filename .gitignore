@@ -1,0 +1,16 @@
+# build output and run logs
+bin/
+logs/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+__pycache__/
+
+# never commit game data or binaries
+*.rpf
+*.ttpf
+*.xvd
+*.exe
+*.dll
