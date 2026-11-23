@@ -199,7 +199,7 @@ static void* h_BinkOpenWithOptions(const char* name, void* opts, uint32_t flags)
     uint32_t want = flags;
     char cl[64]; if (GetEnvironmentVariableA("GTA6_BINK_CLEAR", cl, sizeof cl)) want &= ~(uint32_t)_strtoui64(cl, NULL, 16);
     void* r = g_bkOpen(name, opts, want);
-    if (r && (flags & 0x04000000) && !GetEnvironmentVariableA("GTA6_NO_VIDEO_VIEW", NULL, 0)) {
+    if (r && (flags & 0x04000000) && GetEnvironmentVariableA("GTA6_VIDEO_VIEW", NULL, 0)) {   /* off by default (stand-in only) */
         g_gameBink = r; g_gameBinkClosed = 0;          /* the viewer always follows the newest game handle */
         g_gameOpenTick = GetTickCount64(); g_gameFlags = flags;
         if (!g_viewerBusy) start_cpu_viewer(name);

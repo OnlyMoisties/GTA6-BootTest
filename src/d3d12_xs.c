@@ -83,8 +83,28 @@ typedef struct { void* p; int parent, slot, kind; GUID iid; void* aux; void* met
 /* ---- command recording (emulator step 1) ----
    Command lists keep a record buffer: {u32 slot, u32 nextra, u64 a[6]} followed by nextra extra dwords (copied data).
    Pipeline objects keep meta = PsoMeta (shader code, size, hash, copy of the creation desc). */
-typedef struct { uint64_t code, size, hash; uint8_t desc[0x180]; } PsoMeta;
+typedef struct { uint64_t code, size, hash; uint8_t desc[0x180]; uint32_t regs[7]; int hasregs; } PsoMeta;
 typedef struct { uint8_t* buf; size_t used, cap; } CmdRec;
+/* Resources keep meta = ResMeta (their D3D12_RESOURCE_DESC); memory stays in aux. */
+typedef struct { uint8_t desc[56]; uint64_t size; } ResMeta;
+/* ---- descriptor writing (we are the driver): AMD gfx10 layouts, 32-byte heap slots ----
+   V# (buffer, 4 dw): base[47:0], stride[29:16] of dw1, num_records dw2, dw3 = dst_sel xyzw + format + resource_level.
+   T# (image, 8 dw): base>>8 in dw0/dw1[7:0], FORMAT dw1[28:20] holds the DXGI format (emulator convention),
+   width-1/height-1 in dw2 (14 bits each at [13:0] / [27:14]), depth-1 in dw4[12:0], type in dw3[31:28]. */
+static void write_vbuf(uint32_t* d, uint64_t base, uint32_t size, uint32_t stride) {
+    memset(d, 0, 32);
+    d[0] = (uint32_t)base; d[1] = (uint32_t)((base >> 32) & 0xFFFF) | ((stride & 0x3FFF) << 16);
+    d[2] = stride ? size / stride : size;
+    d[3] = 4 | (5 << 3) | (6 << 6) | (7 << 9) | (22u << 12) | (1u << 24);
+}
+static void write_timg(uint32_t* d, uint64_t base, uint32_t dxgi, uint32_t w, uint32_t h, uint32_t depth, uint32_t mips, uint32_t dim) {
+    memset(d, 0, 32);
+    d[0] = (uint32_t)(base >> 8); d[1] = (uint32_t)((base >> 40) & 0xFF) | ((dxgi & 0x1FF) << 20);
+    d[2] = ((w ? w - 1 : 0) & 0x3FFF) | (((h ? h - 1 : 0) & 0x3FFF) << 14);
+    d[3] = 4 | (5 << 3) | (6 << 6) | (7 << 9) | (((mips ? mips - 1 : 0) & 15) << 16) | ((dim == 4 ? 10u : 9u) << 28);
+    d[4] = (depth ? depth - 1 : 0) & 0x1FFF;
+}
+static volatile LONG g_desclog;
 typedef struct { uint32_t slot, nextra; uint64_t a[6]; } RecHdr;
 static ObjInfo* g_obj;             /* MAXOBJ entries, allocated on first use */
 static void* g_dxgidev;
@@ -200,6 +220,51 @@ static void show_frame(void* pixels, uint32_t w, uint32_t h, LONG frame) {
     TextOutA(dc, 16, 16, s, n);
     ReleaseDC(hwnd, dc);
 }
+/* resource registry for the interpreter: base address -> DXGI format / dims */
+typedef struct { uint64_t base; uint32_t fmt, w, h, d; } ResReg;
+static ResReg g_resreg[65536]; static volatile LONG g_nresreg; static SRWLOCK g_resreg_lk = SRWLOCK_INIT;
+static void resreg_add(uint64_t base, const uint8_t* desc) {
+    if (!base) return;
+    AcquireSRWLockExclusive(&g_resreg_lk);
+    LONG i = g_nresreg; if (i < 65536) { g_resreg[i].base = base; g_resreg[i].fmt = *(const uint32_t*)(desc + 32); g_resreg[i].w = (uint32_t)*(const uint64_t*)(desc + 16);
+        g_resreg[i].h = *(const uint32_t*)(desc + 24); g_resreg[i].d = *(const uint16_t*)(desc + 28); g_nresreg = i + 1; }
+    ReleaseSRWLockExclusive(&g_resreg_lk);
+}
+static const ResReg* emu_res_lookup(uint64_t base) {
+    const ResReg* r = NULL; AcquireSRWLockShared(&g_resreg_lk);
+    for (LONG i = g_nresreg - 1; i >= 0; i--) if (g_resreg[i].base == base) { r = &g_resreg[i]; break; }
+    ReleaseSRWLockShared(&g_resreg_lk); return r;
+}
+#include "rdna2emu.h"
+/* Run workgroup (0,0,0) of a dispatch through the interpreter (GTA6_EMU=1), once per shader; log the outcome. */
+static void emu_try_dispatch(PsoMeta* m, const uint64_t* tables, const RecHdr* h) {
+    static uint64_t done[1024]; static LONG nd; static volatile LONG runs;
+    if (!m || !GetEnvironmentVariableA("GTA6_EMU", NULL, 0)) return;
+    for (LONG i = 0; i < nd && i < 1024; i++) if (done[i] == m->hash) return;
+    if (nd < 1024) done[nd++] = m->hash;
+    if (InterlockedIncrement(&runs) > 64) return;
+    if (!m->hasregs || !readable(m->code, (size_t)m->size)) { dlog("EMU %016llX: no register block", m->hash); return; }
+    const uint32_t* regs = m->regs;
+    uint32_t rsrc2 = regs[6], nuser = (rsrc2 >> 1) & 31, tx = regs[3] & 0xFFFF, ty = regs[3] >> 16, tz = 1;
+    if (!tx) tx = 1; if (!ty) ty = 1;
+    uint32_t user[32] = { 0 };
+    for (int i = 0; i < 4; i++) if (tables[i]) emu_alias(tables[i], 16u << 20);
+    /* finding: s5 = low 32 bits of root table 1, a per-dispatch block the game fills itself with real AMD descriptors + constants */
+    if (nuser >= 6) user[5] = (uint32_t)(tables[1] ? tables[1] : tables[0]);
+    char err[300] = "";
+    for (int ti = 0; ti < 4; ti++) if (tables[ti] && readable(tables[ti], 0x100)) {   /* what each bound descriptor table holds */
+        const uint32_t* q = (const uint32_t*)tables[ti];
+        for (int r = 0; r < 8; r++) dlog("EMU   table%d(%llX)+0x%02X: %08X %08X %08X %08X %08X %08X %08X %08X", ti, tables[ti], r * 32, q[r*8], q[r*8+1], q[r*8+2], q[r*8+3], q[r*8+4], q[r*8+5], q[r*8+6], q[r*8+7]);
+    }
+    {   /* the pipeline's user-data metadata block (desc +0x38, 0x138 bytes), copied at creation into desc? dump live if readable */
+        uint64_t mp = *(uint64_t*)(m->desc + 0x38);
+        if (readable(mp, 0x140)) { const uint32_t* q = (const uint32_t*)mp; for (int r = 0; r < 10; r++) dlog("EMU   meta+0x%03X: %08X %08X %08X %08X %08X %08X %08X %08X", r * 32, q[r*8], q[r*8+1], q[r*8+2], q[r*8+3], q[r*8+4], q[r*8+5], q[r*8+6], q[r*8+7]); }
+    }
+    ULONGLONG t0 = GetTickCount64();
+    int ok = emu_run_group((const uint8_t*)m->code, (size_t)m->size, user, (int)nuser, 0, 0, 0, tx, ty, tz, err, sizeof err);
+    dlog("EMU %016llX dispatch %ux%ux%u group %ux%u user=%u table0=%llX: %s %s (%llu ms)", m->hash, (uint32_t)h->a[0], (uint32_t)h->a[1], (uint32_t)h->a[2],
+        tx, ty, nuser, tables[0], ok ? "RAN TO s_endpgm" : "STOPPED:", ok ? "" : err, GetTickCount64() - t0);
+}
 /* Walk one recorded command list, tracking compute state; log each new (shader, dispatch) combination once.
    This is where the interpreter will execute dispatches. */
 static void replay_list(int lid) {
@@ -211,12 +276,13 @@ static void replay_list(int lid) {
         RecHdr* h = (RecHdr*)(r->buf + off); const uint32_t* ex = (const uint32_t*)(h + 1);
         switch (h->slot) {
         case 25: pso = objid(h->a[0]); break;
-        case 29: rootsig = objid(h->a[0]); break;
+        /* Xbox list layout: compute root methods sit 4 slots after the public ones */
+        case 33: rootsig = objid(h->a[0]); break;                               /* SetComputeRootSignature */
         case 28: for (uint32_t i = 0; i < h->nextra / 2 && i < 2; i++) heaps[i] = ((const uint64_t*)ex)[i]; break;
-        case 31: if (h->a[0] < 16) tables[h->a[0]] = h->a[1]; break;
-        case 37: case 39: case 41: if (h->a[0] < 16) views[h->a[0]] = h->a[1]; break;
-        case 33: if (h->a[0] < 16 && h->a[2] < 64) { consts[h->a[0]][h->a[2]] = (uint32_t)h->a[1]; cmask[h->a[0]] |= 1; } break;
-        case 35: if (h->a[0] < 16) for (uint32_t i = 0; i < h->nextra && h->a[3] + i < 64; i++) { consts[h->a[0]][h->a[3] + i] = ex[i]; cmask[h->a[0]] |= 1; } break;
+        case 35: if (h->a[0] < 16) tables[h->a[0]] = h->a[1]; break;            /* SetComputeRootDescriptorTable */
+        case 41: case 43: case 45: if (h->a[0] < 16) views[h->a[0]] = h->a[1]; break;
+        case 37: if (h->a[0] < 16 && h->a[2] < 64) { consts[h->a[0]][h->a[2]] = (uint32_t)h->a[1]; cmask[h->a[0]] |= 1; } break;
+        case 39: if (h->a[0] < 16) for (uint32_t i = 0; i < h->nextra && h->a[3] + i < 64; i++) { consts[h->a[0]][h->a[3] + i] = ex[i]; cmask[h->a[0]] |= 1; } break;
         case 14: {
             static volatile LONG seqdump;
             if (InterlockedIncrement(&seqdump) <= 2) {               /* full call sequence of this list up to the dispatch */
@@ -229,7 +295,8 @@ static void replay_list(int lid) {
                 }
             }
             PsoMeta* m = (pso > 0) ? (PsoMeta*)g_obj[pso].meta : NULL;
-            uint64_t key = (m ? m->hash : 0) ^ ((uint64_t)(uint32_t)h->a[0] << 40) ^ ((uint64_t)(uint32_t)h->a[1] << 20) ^ (uint32_t)h->a[2];
+            emu_try_dispatch(m, tables, h);
+            uint64_t key =(m ? m->hash : 0) ^ ((uint64_t)(uint32_t)h->a[0] << 40) ^ ((uint64_t)(uint32_t)h->a[1] << 20) ^ (uint32_t)h->a[2];
             int isnew = 1; for (LONG i = 0; i < nseen && i < 4096; i++) if (seen[i] == key) { isnew = 0; break; }
             if (isnew && nseen < 4096) seen[nseen++] = key;
             if (isnew && InterlockedIncrement(&logged) <= 400) {
@@ -327,6 +394,12 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
             }
             if (id == 0 && slot == 29 && no > 0) { int h = objid(arg[0]); if (h > 0 && g_obj[h].aux) g_obj[no].aux = (uint8_t*)g_obj[h].aux + arg[1]; }
             if (id == 0 && slot == 133 && no > 0) g_obj[no].aux = (void*)arg[0];
+            /* keep each resource's description for view creation */
+            if (id == 0 && no > 0 && (slot == 27 || slot == 127 || slot == 29 || slot == 133)) {
+                uint64_t dp = (slot == 133) ? arg[1] : arg[2];
+                ResMeta* rm = (ResMeta*)calloc(1, sizeof(ResMeta));
+                if (rm && readable(dp, 56)) { memcpy(rm->desc, (void*)dp, 56); rm->size = res_size(dp); g_obj[no].meta = rm; resreg_add((uint64_t)g_obj[no].aux, rm->desc); } else free(rm);
+            }
             /* committed resources (public slot 27, Xbox slot 127): allocate their memory like the console driver does */
             if (id == 0 && (slot == 27 || slot == 127) && objid((uint64_t)o) > 0) {
                 uint64_t sz = res_size(arg[2]);
@@ -379,6 +452,7 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
                 if (m->size >= 16 && m->size <= (4u << 20) && readable(m->code, (size_t)m->size)) for (uint64_t i = 0; i < m->size; i++) { h ^= ((uint8_t*)m->code)[i]; h *= 1099511628211ull; }
                 m->hash = h;
                 if (readable(arg[0], sizeof m->desc)) memcpy(m->desc, (void*)arg[0], sizeof m->desc);
+                { uint64_t rp = ((uint64_t*)arg[0])[1]; if (readable(rp, sizeof m->regs)) { memcpy(m->regs, (void*)rp, sizeof m->regs); m->hasregs = 1; } }
                 g_obj[po].meta = m;
             }
         }
@@ -437,18 +511,50 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
             }
         }
     }
+    /* ---- descriptor creation: write hardware descriptors into the heap slot ---- */
+    if (id == 0 && !sret && slot >= 17 && slot <= 24) {
+        uint64_t dst = 0; const char* what = "";
+        switch (slot) {
+        case 17:                                                 /* CreateConstantBufferView(desc{gpuVA, size}, handle) */
+            dst = arg[1]; what = "CBV";
+            if (readable(arg[0], 12) && writable(dst, 32)) write_vbuf((uint32_t*)dst, ((uint64_t*)arg[0])[0], ((uint32_t*)arg[0])[2], 0);
+            break;
+        case 18: case 19: {                                      /* SRV(res, desc, handle) / UAV(res, counter, desc, handle) */
+            int ro = objid(arg[0]); uint64_t vd = slot == 18 ? arg[1] : arg[2]; dst = slot == 18 ? arg[2] : arg[3]; what = slot == 18 ? "SRV" : "UAV";
+            if (!writable(dst, 32)) break;
+            ResMeta* rm = (ro > 0 && g_obj[ro].iid.Data1 == 0x696442BE) ? (ResMeta*)g_obj[ro].meta : NULL;
+            uint64_t base = ro > 0 ? (uint64_t)g_obj[ro].aux : 0;
+            if (!rm) { memset((void*)dst, 0, 32); break; }      /* null view */
+            uint32_t rdim = *(uint32_t*)rm->desc, fmt = *(uint32_t*)(rm->desc + 32);
+            if (readable(vd, 8) && *(uint32_t*)vd) fmt = *(uint32_t*)vd;
+            if (rdim == 1) {                                     /* buffer: view desc Buffer{FirstElement u64 @+8, NumElements u32 @+16, StructureByteStride u32 @+20} */
+                uint64_t first = readable(vd, 24) ? *(uint64_t*)(vd + 8) : 0; uint32_t n = readable(vd, 24) ? *(uint32_t*)(vd + 16) : 0, st = readable(vd, 24) ? *(uint32_t*)(vd + 20) : 0;
+                uint32_t es = st ? st : (fmt ? (uint32_t)(fmt_bpp(fmt) > 0 ? fmt_bpp(fmt) / 8 : 4) : 4);
+                write_vbuf((uint32_t*)dst, base + first * es, n ? n * es : (uint32_t)rm->size, st);
+            } else {
+                write_timg((uint32_t*)dst, base, fmt, (uint32_t)*(uint64_t*)(rm->desc + 16), *(uint32_t*)(rm->desc + 24), *(uint16_t*)(rm->desc + 28), *(uint16_t*)(rm->desc + 30), rdim);
+            }
+            break; }
+        case 24:                                                 /* CopyDescriptorsSimple(n, dstStart, srcStart, type) */
+            what = "copy";
+            if ((uint32_t)arg[0] <= 65536 && writable(arg[1], (size_t)(uint32_t)arg[0] * 32) && readable(arg[2], (size_t)(uint32_t)arg[0] * 32))
+                memmove((void*)arg[1], (void*)arg[2], (size_t)(uint32_t)arg[0] * 32);
+            break;
+        }
+        if (dst && InterlockedIncrement(&g_desclog) <= 8 && readable(dst, 32)) { const uint32_t* q = (const uint32_t*)dst;
+            dlog("DESC %s -> %llX: %08X %08X %08X %08X %08X %08X %08X %08X", what, dst, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]); }
+    }
     /* ---- record compute-relevant command-list calls ---- */
     if (id > 0 && g_obj[id].iid.Data1 == 0x5B160D0F && !sret) {
         int rec = 0; uint32_t extra = 0; const void* src = NULL;
         switch (slot) {
         case 10: {                                               /* Reset(allocator, pso): start a fresh recording */
             CmdRec* r = (CmdRec*)g_obj[id].meta; if (r) r->used = 0; rec = 1; break; }
-        case 14: case 25: case 28: case 29: case 31: case 33: case 37: case 39: case 41: case 9: rec = 1; break;
+        case 14: case 25: case 28: case 29: case 31: case 33: case 37: case 41: case 43: case 45: case 9: rec = 1; break;
+        case 39: rec = 1; if ((uint32_t)arg[1] <= 64 && readable(arg[2], (size_t)(uint32_t)arg[1] * 4)) { extra = (uint32_t)arg[1]; src = (const void*)arg[2]; } break;
         default: if (slot >= 60) { rec = 1;                      /* Xbox-specific methods: keep them, plus 16 dwords behind arg[1] */
                      if (readable(arg[1], 64)) { extra = 16; src = (const void*)arg[1]; } } break;
-        case 35:                                                 /* SetComputeRoot32BitConstants(root, n, data, offset): copy data */
-            if ((uint32_t)arg[1] <= 64 && readable(arg[2], (size_t)(uint32_t)arg[1] * 4)) { extra = (uint32_t)arg[1]; src = (const void*)arg[2]; }
-            rec = 1; break;
+        case 35: rec = 1; break;                                 /* Xbox: SetComputeRootDescriptorTable(index, gpuHandle) */
         case 28 + 1000: break;
         }
         if (slot == 28 && (uint32_t)arg[0] <= 2 && readable(arg[1], 16)) { extra = (uint32_t)arg[0] * 2; src = (const void*)arg[1]; }   /* heap pointers */
