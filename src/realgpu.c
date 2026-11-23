@@ -160,6 +160,11 @@ static void gm_sync(void) {
             }
             for (int k = 0; k < 65536; k++) { uint32_t e = tmp[k]; dst[k] = (e && (e >> 24) - 1 < vis) ? e : 0; }
             g_ptabmap[0] = (uint32_t)g_slot[0];
+            {   static int checks; if (g_gmem->nalias && checks < 6 && vis >= (uint32_t)g_gmem->nsec) {   /* alias page must resolve to the same physical page as the CPU page it mirrors */
+                    checks++; uint64_t ga = g_gmem->alias[0].gpu + 0xB5DEA0, ca = g_gmem->alias[0].cpu + 0xB5DEA0;
+                    if (0xB5DEA0 < g_gmem->alias[0].size) rlog("alias check: gpu %llX -> entry %08X | cpu %llX -> entry %08X (xmem %08X)%s", ga, dst[(ga >> 16) & 0xFFFF], ca, dst[(ca >> 16) & 0xFFFF],
+                        g_gmem->dir[0] ? g_gmem->dir[0][(ca >> 16) & 0xFFFF] : 0, dst[(ga >> 16) & 0xFFFF] == dst[(ca >> 16) & 0xFFFF] && dst[(ga >> 16) & 0xFFFF] ? "  OK" : "  MISMATCH");
+                } }
         }
     }
 }
@@ -396,7 +401,7 @@ static void rt_state(int i, D3D12_RESOURCE_STATES want) {
     b.Transition.StateBefore = g_rt[i].st; b.Transition.StateAfter = want; ID3D12GraphicsCommandList_ResourceBarrier(g_list, 1, &b); g_rt[i].st = want;
 }
 /* ordered per-frame operations: draws and clears, in the game's order */
-typedef struct { int kind; ID3D12PipelineState* pso; uint32_t vsc[68], psc[68]; uint32_t verts, insts; int prim; float vp[6]; int rt; float clear[4]; } XDraw;
+typedef struct { int kind; uint64_t vh, ph; ID3D12PipelineState* pso; uint32_t vsc[68], psc[68]; uint32_t verts, insts; int prim; float vp[6]; int rt; float clear[4]; } XDraw;
 static XDraw* g_xq; static int g_nxq, g_capxq; static SRWLOCK g_xqlk = SRWLOCK_INIT;
 static void* load_file(const char* path, size_t* len) {
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL); if (f == INVALID_HANDLE_VALUE) return NULL;
@@ -415,7 +420,8 @@ static void note_needed(uint64_t vh, uint64_t ph) {
 }
 static int make_xrs(void) {
     if (g_xrs) return 1;
-    D3D12_ROOT_PARAMETER1 p[3] = { 0 };
+    D3D12_ROOT_PARAMETER1 p[4] = { 0 };
+    p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[3].Descriptor.ShaderRegister = 0; p[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;   /* VS debug buffer */
     p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[0].Descriptor.ShaderRegister = 0; p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; p[1].Descriptor.ShaderRegister = 1; p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     p[0].Descriptor.Flags = p[1].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
@@ -423,7 +429,7 @@ static int make_xrs(void) {
     D3D12_STATIC_SAMPLER_DESC ss = { D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         0, 1, D3D12_COMPARISON_FUNC_NEVER, D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK, 0, D3D12_FLOAT32_MAX, 0, 0, D3D12_SHADER_VISIBILITY_ALL };
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC rd = { D3D_ROOT_SIGNATURE_VERSION_1_1 };
-    rd.Desc_1_1.NumParameters = 3; rd.Desc_1_1.pParameters = p; rd.Desc_1_1.NumStaticSamplers = 1; rd.Desc_1_1.pStaticSamplers = &ss;
+    rd.Desc_1_1.NumParameters = 4; rd.Desc_1_1.pParameters = p; rd.Desc_1_1.NumStaticSamplers = 1; rd.Desc_1_1.pStaticSamplers = &ss;
     rd.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
     ID3DBlob *blob = NULL, *err = NULL;
     if (FAILED(D3D12SerializeVersionedRootSignature(&rd, &blob, &err))) { rlog("translated root signature serialize failed: %s", err ? (char*)ID3D10Blob_GetBufferPointer(err) : "?"); return 0; }
@@ -469,7 +475,7 @@ void rg_queue_xlat_draw(uint64_t vh, uint64_t ph, const uint32_t* vsc, const uin
     ID3D12PipelineState* pso = get_xpso(vh, ph, prim, rtf); if (!pso) return;
     AcquireSRWLockExclusive(&g_xqlk);
     XDraw* q = xq_add();
-    if (q) { q->kind = 0; q->pso = pso; memcpy(q->vsc, vsc, sizeof q->vsc); memcpy(q->psc, psc, sizeof q->psc);
+    if (q) { q->kind = 0; q->vh = vh; q->ph = ph; q->pso = pso; memcpy(q->vsc, vsc, sizeof q->vsc); memcpy(q->psc, psc, sizeof q->psc);
              q->verts = verts; q->insts = insts; q->prim = prim; memcpy(q->vp, vp, sizeof q->vp); q->rt = rt; }
     ReleaseSRWLockExclusive(&g_xqlk);
 }
@@ -494,31 +500,55 @@ static void build_blit(void) {
     HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(g_dev, &d, &IID_ID3D12PipelineState, (void**)&g_blitpso);
     free(vs); free(ps); if (FAILED(hr)) rlog("present blit pipeline failed 0x%08lX", hr);
 }
+/* GTA6_VSDEBUG=1: one draw per frame (first draw of each new shader pair) has its translated VS write vertices 0..2
+   positions, vertex 0's first attribute and user SGPRs s0..s15 to a debug buffer; logged once the frame's fence passed */
+#define SUB_RING 16
+#define NSLOT (SUB_RING + NBUF)                          /* 0..15 submissions, 16.. presents */
+static ID3D12Resource *g_supl[NSLOT]; static uint8_t* g_supm[NSLOT];   /* upload buffer per slot */
+static ID3D12Resource *g_dbgbuf, *g_dbgrb[NSLOT]; static int g_dbgpend[NSLOT]; static uint64_t g_dbgvh[NSLOT], g_dbgph[NSLOT];
+static void dbg_report(UINT bi) {
+    if (!g_dbgpend[bi] || !g_dbgrb[bi]) return; g_dbgpend[bi] = 0;
+    float* f = NULL; D3D12_RANGE r = { 0, 128 };
+    if (FAILED(ID3D12Resource_Map(g_dbgrb[bi], 0, &r, (void**)&f)) || !f) return;
+    const uint32_t* u = (const uint32_t*)f;
+    rlog("VSDEBUG vs %016llX ps %016llX: pos0 %g %g %g %g | pos1 %g %g %g %g | pos2 %g %g %g %g", g_dbgvh[bi], g_dbgph[bi], f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
+    rlog("VSDEBUG   attr0 %08X %08X %08X %08X  s0..s15: %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X",
+        u[12], u[13], u[14], u[15], u[16], u[17], u[18], u[19], u[20], u[21], u[22], u[23], u[24], u[25], u[26], u[27], u[28], u[29], u[30], u[31]);
+    D3D12_RANGE z = { 0, 0 }; ID3D12Resource_Unmap(g_dbgrb[bi], 0, &z);
+}
 static uint64_t g_presaddr;                            /* address of the render target the game presents this frame */
 void rg_set_present(uint64_t addr) { g_presaddr = addr; }
 static void run_xlat(UINT bi, D3D12_CPU_DESCRIPTOR_HANDLE bbrtv, float sx, float sy, UINT bw, UINT bh) {
     if (!g_ptab || !g_srvheap || !make_xrs()) { g_nxq = 0; return; }
-    if (!g_upload[bi]) {
+    if (!g_supl[bi]) {
         D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_UPLOAD };
         D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, UPLOAD_SIZE, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
-        if (FAILED(ID3D12Device_CreateCommittedResource(g_dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g_upload[bi]))) { g_nxq = 0; return; }
-        ID3D12Resource_Map(g_upload[bi], 0, NULL, (void**)&g_upmap[bi]);
+        if (FAILED(ID3D12Device_CreateCommittedResource(g_dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g_supl[bi]))) { g_nxq = 0; return; }
+        ID3D12Resource_Map(g_supl[bi], 0, NULL, (void**)&g_supm[bi]);
     }
-    D3D12_GPU_VIRTUAL_ADDRESS ub = ID3D12Resource_GetGPUVirtualAddress(g_upload[bi]); size_t off = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS ub = ID3D12Resource_GetGPUVirtualAddress(g_supl[bi]); size_t off = 0;
+    static int vsdbg = -1; if (vsdbg < 0) vsdbg = GetEnvironmentVariableA("GTA6_VSDEBUG", NULL, 0) ? 1 : 0;
+    dbg_report(bi);
+    if (!g_dbgbuf) { D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT }; D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+        ID3D12Device_CreateCommittedResource(g_dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void**)&g_dbgbuf); }
+    static uint64_t dbgdone[64][2]; static int ndbgdone; int flagged = -1;
     ID3D12GraphicsCommandList_SetDescriptorHeaps(g_list, 1, &g_srvheap);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(g_list, g_xrs);
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(g_list, 2, ID3D12Resource_GetGPUVirtualAddress(g_ptab));
+    if (g_dbgbuf) ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(g_list, 3, ID3D12Resource_GetGPUVirtualAddress(g_dbgbuf));
     AcquireSRWLockExclusive(&g_xqlk);
-    int lastprim = -1, currt = -2, ndraw = 0, nclear = 0;
+    int hasbb = bbrtv.ptr != 0;                           /* submissions run without a back buffer */
+    int lastprim = -1, currt = -2; static int ndraw, nclear; static int perrt[RT_MAX + 1], clrrt[RT_MAX + 1]; static float lastclr[RT_MAX][4];
     for (int i = 0; i < g_nxq; i++) {
         XDraw* q = &g_xq[i];
         if (q->kind == 1) {                                       /* clear a cached render target */
             if (q->rt < 0 || q->rt >= g_nrt) continue;
             rt_state(q->rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            ID3D12GraphicsCommandList_ClearRenderTargetView(g_list, rt_rtv(q->rt), q->clear, 0, NULL); nclear++;
+            ID3D12GraphicsCommandList_ClearRenderTargetView(g_list, rt_rtv(q->rt), q->clear, 0, NULL); nclear++; clrrt[q->rt]++; memcpy(lastclr[q->rt], q->clear, 16);
             continue;
         }
         if (off + 2 * STAGE_CB > UPLOAD_SIZE) break;
+        if (q->rt < 0 && !hasbb) continue;
         /* textures this draw samples must be readable; its own target writable */
         for (int t = 0; t < 8; t++) { uint32_t s = q->psc[36 + t * 4 + 2]; if (s >= RT_SRV0 && s < RT_SRV0 + (uint32_t)g_nrt && (int)(s - RT_SRV0) != q->rt) rt_state((int)(s - RT_SRV0), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); }
         if (q->rt != currt || (q->rt >= 0 && g_rt[q->rt].st != D3D12_RESOURCE_STATE_RENDER_TARGET)) {
@@ -527,21 +557,44 @@ static void run_xlat(UINT bi, D3D12_CPU_DESCRIPTOR_HANDLE bbrtv, float sx, float
             currt = q->rt;
         }
         float ax = (q->rt >= 0) ? 1.0f : sx, ay = (q->rt >= 0) ? 1.0f : sy;
+        {   static int nvl[RT_MAX + 1]; int slot = q->rt >= 0 ? q->rt : RT_MAX;
+            if (nvl[slot] < 3) { nvl[slot]++; rlog("draw into %s%d: viewport %.1f %.1f %.1f %.1f depth %.2f..%.2f, %u verts x %u, prim %d",
+                q->rt >= 0 ? "rt" : "backbuffer", q->rt, q->vp[0], q->vp[1], q->vp[2], q->vp[3], q->vp[4], q->vp[5], q->verts, q->insts, q->prim); } }
         D3D12_VIEWPORT v = { q->vp[0] * ax, q->vp[1] * ay, q->vp[2] * ax, q->vp[3] * ay, q->vp[4], q->vp[5] };
         D3D12_RECT sc = { (LONG)v.TopLeftX, (LONG)v.TopLeftY, (LONG)(v.TopLeftX + v.Width), (LONG)(v.TopLeftY + v.Height) };
         ID3D12GraphicsCommandList_RSSetViewports(g_list, 1, &v); ID3D12GraphicsCommandList_RSSetScissorRects(g_list, 1, &sc);
-        if (q->prim != lastprim) { ID3D12GraphicsCommandList_IASetPrimitiveTopology(g_list, (D3D_PRIMITIVE_TOPOLOGY)(q->prim ? q->prim : 4)); lastprim = q->prim; }
+        if (q->prim != lastprim) {     /* must agree with the pipeline's topology type (get_xpso): unknown values draw as a triangle list */
+            static uint32_t seen[16]; static int ns; int known = 0; for (int s = 0; s < ns; s++) if (seen[s] == (uint32_t)q->prim) known = 1;
+            if (!known && ns < 16) { seen[ns++] = (uint32_t)q->prim; rlog("draw topology value seen: %d", q->prim); }
+            int tp = (q->prim >= 1 && q->prim <= 5) ? q->prim : 4;
+            ID3D12GraphicsCommandList_IASetPrimitiveTopology(g_list, (D3D_PRIMITIVE_TOPOLOGY)tp); lastprim = q->prim; }
         ID3D12GraphicsCommandList_SetPipelineState(g_list, q->pso);
-        memcpy(g_upmap[bi] + off, q->vsc, sizeof q->vsc); memcpy(g_upmap[bi] + off + STAGE_CB, q->psc, sizeof q->psc);
+        q->vsc[35] = 0;
+        if (vsdbg && flagged < 0 && ndbgdone < 64 && g_dbgbuf && g_gmem && g_secvis >= g_gmem->nsec) {   /* only once all pool memory is visible */
+            int seen = 0; for (int k = 0; k < ndbgdone; k++) if (dbgdone[k][0] == q->vh && dbgdone[k][1] == q->ph) seen = 1;
+            if (!seen) { dbgdone[ndbgdone][0] = q->vh; dbgdone[ndbgdone][1] = q->ph; ndbgdone++; flagged = i; q->vsc[35] = 1; g_dbgvh[bi] = q->vh; g_dbgph[bi] = q->ph; }
+        }
+        memcpy(g_supm[bi] + off, q->vsc, sizeof q->vsc); memcpy(g_supm[bi] + off + STAGE_CB, q->psc, sizeof q->psc);
         ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(g_list, 0, ub + off);
         ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(g_list, 1, ub + off + STAGE_CB);
         off += 2 * STAGE_CB;
-        ID3D12GraphicsCommandList_DrawInstanced(g_list, q->verts, q->insts ? q->insts : 1, 0, 0); ndraw++;
+        ID3D12GraphicsCommandList_DrawInstanced(g_list, q->verts, q->insts ? q->insts : 1, 0, 0); ndraw++; perrt[q->rt >= 0 ? q->rt : RT_MAX]++;
     }
     g_nxq = 0;
     ReleaseSRWLockExclusive(&g_xqlk);
+    if (flagged >= 0) {
+        if (!g_dbgrb[bi]) { D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_READBACK }; D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+            ID3D12Device_CreateCommittedResource(g_dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&g_dbgrb[bi]); }
+        if (g_dbgrb[bi]) {
+            D3D12_RESOURCE_BARRIER b = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION }; b.Transition.pResource = g_dbgbuf; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE; ID3D12GraphicsCommandList_ResourceBarrier(g_list, 1, &b);
+            ID3D12GraphicsCommandList_CopyBufferRegion(g_list, g_dbgrb[bi], 0, g_dbgbuf, 0, 256);
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE; b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; ID3D12GraphicsCommandList_ResourceBarrier(g_list, 1, &b);
+            g_dbgpend[bi] = 1;
+        }
+    }
     /* show the presented render target, scaled to the window */
-    int prt = -1; for (int i = 0; i < g_nrt; i++) if (g_rt[i].addr == g_presaddr && g_rt[i].drawn) { prt = i; break; }
+    int prt = -1; if (hasbb) for (int i = 0; i < g_nrt; i++) if (g_rt[i].addr == g_presaddr && g_rt[i].drawn) { prt = i; break; }
     if (prt >= 0) build_blit();
     if (prt >= 0 && g_blitpso && off + 2 * STAGE_CB <= UPLOAD_SIZE) {
         rt_state(prt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -550,18 +603,90 @@ static void run_xlat(UINT bi, D3D12_CPU_DESCRIPTOR_HANDLE bbrtv, float sx, float
         ID3D12GraphicsCommandList_RSSetViewports(g_list, 1, &v); ID3D12GraphicsCommandList_RSSetScissorRects(g_list, 1, &sc);
         ID3D12GraphicsCommandList_SetPipelineState(g_list, g_blitpso);
         ID3D12GraphicsCommandList_IASetPrimitiveTopology(g_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        uint32_t* c = (uint32_t*)(g_upmap[bi] + off); memset(c, 0, 2 * STAGE_CB); c[0] = (uint32_t)(RT_SRV0 + prt);
+        uint32_t* c = (uint32_t*)(g_supm[bi] + off); memset(c, 0, 2 * STAGE_CB); c[0] = (uint32_t)(RT_SRV0 + prt);
         ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(g_list, 0, ub + off);      /* the blit VS uses no constants */
         ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(g_list, 1, ub + off);      /* blit PS: g_srv at b1 */
         ID3D12GraphicsCommandList_DrawInstanced(g_list, 3, 1, 0, 0);
     }
     static int logged; static ULONGLONG last; ULONGLONG now = GetTickCount64();
-    if (logged < 3 || now - last > 5000) { logged++; last = now; rlog("frame: %d translated draws, %d clears, %d cached render targets, presented %s", ndraw, nclear, g_nrt, prt >= 0 ? "a cached render target" : "the back buffer"); }
+    if (hasbb && (logged < 3 || now - last > 5000)) { logged++; last = now; rlog("frame: %d translated draws, %d clears, %d cached render targets, presented %s", ndraw, nclear, g_nrt, prt >= 0 ? "a cached render target" : "the back buffer");
+        char s[600]; size_t k = 0; s[0] = 0;
+        for (int r = 0; r < g_nrt && k < 500; r++) k += snprintf(s + k, sizeof s - k, " rt%d:%dd/%dc(last clear %.2f %.2f %.2f %.2f)%s", r, perrt[r], clrrt[r], lastclr[r][0], lastclr[r][1], lastclr[r][2], lastclr[r][3], r == prt ? "[presented]" : "");
+        rlog("   per target:%s backbuffer:%dd", s, perrt[RT_MAX]); }
+    if (hasbb) { ndraw = nclear = 0; memset(perrt, 0, sizeof perrt); memset(clrrt, 0, sizeof clrrt); }
+}
+
+/* ---- submissions: translated work recorded and sent to the real GPU at the title's ExecuteCommandLists ---- */
+static ID3D12CommandAllocator* g_sal[SUB_RING]; static UINT64 g_salv[SUB_RING]; static ID3D12GraphicsCommandList* g_slist; static int g_sidx;
+static SRWLOCK g_gpulk = SRWLOCK_INIT;                 /* one recorder at a time (submissions and presents share g_list) */
+uint64_t rg_completed(void) { return g_state == 1 ? ID3D12Fence_GetCompletedValue(g_fence) : ~0ull; }
+void rg_wait(uint64_t v, DWORD ms) {
+    if (g_state != 1 || ID3D12Fence_GetCompletedValue(g_fence) >= v) return;
+    HANDLE e = CreateEventA(NULL, FALSE, FALSE, NULL); ID3D12Fence_SetEventOnCompletion(g_fence, v, e); WaitForSingleObject(e, ms); CloseHandle(e);
+}
+uint64_t rg_submit(void) {
+    if (g_state != 1 || !g_nxq) return 0;
+    AcquireSRWLockExclusive(&g_gpulk);
+    gm_sync();
+    int s = g_sidx; g_sidx = (g_sidx + 1) % SUB_RING;
+    if (!g_sal[s] && FAILED(ID3D12Device_CreateCommandAllocator(g_dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void**)&g_sal[s]))) { ReleaseSRWLockExclusive(&g_gpulk); return 0; }
+    rg_wait(g_salv[s], 5000);                          /* the slot's allocator + upload buffer must be free */
+    ID3D12CommandAllocator_Reset(g_sal[s]);
+    if (!g_slist) { if (FAILED(ID3D12Device_CreateCommandList(g_dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_sal[s], NULL, &IID_ID3D12GraphicsCommandList, (void**)&g_slist))) { ReleaseSRWLockExclusive(&g_gpulk); return 0; } }
+    else ID3D12GraphicsCommandList_Reset(g_slist, g_sal[s], NULL);
+    ID3D12GraphicsCommandList* save = g_list; g_list = g_slist;
+    D3D12_CPU_DESCRIPTOR_HANDLE none = { 0 };
+    run_xlat((UINT)s, none, 1.0f, 1.0f, 0, 0);
+    g_list = save;
+    ID3D12GraphicsCommandList_Close(g_slist);
+    ID3D12CommandQueue_ExecuteCommandLists(g_q, 1, (ID3D12CommandList**)&g_slist);
+    UINT64 v = g_fencenext++; ID3D12CommandQueue_Signal(g_q, g_fence, v); g_salv[s] = v;
+    ReleaseSRWLockExclusive(&g_gpulk);
+    static int nl; if (nl++ < 3) rlog("submitted translated work to the real GPU (fence %llu)", v);
+    return v;
+}
+
+/* GTA6_SHOT debug: copy every cached 4-byte-per-pixel render target (up to 6) to readback, written as rt<i>_<frame>.bmp */
+static ID3D12Resource* g_rtdump[6]; static UINT g_rtpitch[6];
+static void rt_dump_queue(void) {
+    for (int i = 0; i < g_nrt && i < 6; i++) {
+        DXGI_FORMAT f = g_rt[i].fmt; if (f != DXGI_FORMAT_R8G8B8A8_UNORM && f != DXGI_FORMAT_B8G8R8A8_UNORM && f != DXGI_FORMAT_R10G10B10A2_UNORM) continue;
+        UINT pitch = (g_rt[i].w * 4 + 255) & ~255u; g_rtpitch[i] = pitch;
+        if (!g_rtdump[i]) { D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_READBACK }; D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, (UINT64)pitch * g_rt[i].h, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR };
+            if (FAILED(ID3D12Device_CreateCommittedResource(g_dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&g_rtdump[i]))) continue; }
+        rt_state(i, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION src = { g_rt[i].tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }; src.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION dst = { g_rtdump[i], D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+        dst.PlacedFootprint.Footprint.Format = f; dst.PlacedFootprint.Footprint.Width = g_rt[i].w; dst.PlacedFootprint.Footprint.Height = g_rt[i].h; dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = pitch;
+        ID3D12GraphicsCommandList_CopyTextureRegion(g_list, &dst, 0, 0, 0, &src, NULL);
+    }
+}
+static void rt_dump_write(int frame) {
+    char path[MAX_PATH]; char* sl; if (!GetEnvironmentVariableA("GTA6_STUB_LOG", path, MAX_PATH) || (sl = strrchr(path, '\\')) == NULL) return;
+    for (int i = 0; i < g_nrt && i < 6; i++) {
+        if (!g_rtdump[i] || g_rt[i].st != D3D12_RESOURCE_STATE_COPY_SOURCE) continue;
+        uint8_t* p = NULL; UINT w = g_rt[i].w, h = g_rt[i].h, pitch = g_rtpitch[i]; D3D12_RANGE r = { 0, (SIZE_T)pitch * h };
+        if (FAILED(ID3D12Resource_Map(g_rtdump[i], 0, &r, (void**)&p)) || !p) continue;
+        snprintf(sl + 1, MAX_PATH - (sl + 1 - path), "rt%d_%d.bmp", i, frame);
+        HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            uint32_t img = w * h * 4; DWORD wr; uint8_t hdr[54] = { 'B', 'M' }; *(uint32_t*)(hdr + 2) = 54 + img; *(uint32_t*)(hdr + 10) = 54; *(uint32_t*)(hdr + 14) = 40;
+            *(int32_t*)(hdr + 18) = (int32_t)w; *(int32_t*)(hdr + 22) = -(int32_t)h; *(uint16_t*)(hdr + 26) = 1; *(uint16_t*)(hdr + 28) = 32; *(uint32_t*)(hdr + 34) = img;
+            WriteFile(f, hdr, 54, &wr, NULL);
+            uint8_t* row = (uint8_t*)malloc(w * 4);
+            for (UINT y = 0; y < h && row; y++) { memcpy(row, p + (size_t)y * pitch, w * 4);
+                if (g_rt[i].fmt == DXGI_FORMAT_R8G8B8A8_UNORM) for (UINT x = 0; x < w; x++) { uint8_t tmp = row[x * 4]; row[x * 4] = row[x * 4 + 2]; row[x * 4 + 2] = tmp; }   /* BMP wants BGRA */
+                WriteFile(f, row, w * 4, &wr, NULL); }
+            free(row); CloseHandle(f); rlog("render target %d dumped -> %s", i, path);
+        }
+        D3D12_RANGE z = { 0, 0 }; ID3D12Resource_Unmap(g_rtdump[i], 0, &z);
+    }
 }
 
 /* Clear the next back buffer to rgba and present it (sync interval 0: pacing is done by the caller). */
 int rg_present_clear(const float* rgba) {
     if (g_state != 1) return 0;
+    AcquireSRWLockExclusive(&g_gpulk);
     gm_sync(); gm_selftest();
     UINT i = IDXGISwapChain3_GetCurrentBackBufferIndex(g_sc);
     if (ID3D12Fence_GetCompletedValue(g_fence) < g_fenceval[i]) { ID3D12Fence_SetEventOnCompletion(g_fence, g_fenceval[i], g_fev); WaitForSingleObject(g_fev, 1000); }
@@ -575,7 +700,7 @@ int rg_present_clear(const float* rgba) {
     ID3D12GraphicsCommandList_ClearRenderTargetView(g_list, h, rgba, 0, NULL);
     { D3D12_RESOURCE_DESC bd; ID3D12Resource_GetDesc(g_bb[i], &bd);
       run_queued(i, h, (float)bd.Width / 3840.0f, (float)bd.Height / 2160.0f);
-      run_xlat(i, h, (float)bd.Width / 3840.0f, (float)bd.Height / 2160.0f, (UINT)bd.Width, bd.Height); }
+      run_xlat(SUB_RING + i, h, (float)bd.Width / 3840.0f, (float)bd.Height / 2160.0f, (UINT)bd.Width, bd.Height); }
     /* readback: the centre pixel a few times, and with GTA6_SHOT=1 full frames (600, 1500, 3000, 4500) -> <logs>\shot_<frame>.bmp */
     static ID3D12Resource* rb; static UINT64 rbsize; static int rbcount; static int shots = -1;
     if (shots < 0) shots = GetEnvironmentVariableA("GTA6_SHOT", NULL, 0) ? 1 : 0;
@@ -598,7 +723,7 @@ int rg_present_clear(const float* rgba) {
         D3D12_TEXTURE_COPY_LOCATION src = { g_bb[i], D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }; src.SubresourceIndex = 0;
         D3D12_TEXTURE_COPY_LOCATION dst = { rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
         dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM; dst.PlacedFootprint.Footprint.Depth = 1;
-        if (doshot) { dst.PlacedFootprint.Footprint.Width = (UINT)bd.Width; dst.PlacedFootprint.Footprint.Height = bd.Height; dst.PlacedFootprint.Footprint.RowPitch = pitch;
+        if (doshot) { rt_dump_queue(); dst.PlacedFootprint.Footprint.Width = (UINT)bd.Width; dst.PlacedFootprint.Footprint.Height = bd.Height; dst.PlacedFootprint.Footprint.RowPitch = pitch;
             ID3D12GraphicsCommandList_CopyTextureRegion(g_list, &dst, 0, 0, 0, &src, NULL); }
         else { dst.PlacedFootprint.Footprint.Width = 1; dst.PlacedFootprint.Footprint.Height = 1; dst.PlacedFootprint.Footprint.RowPitch = 256;
             D3D12_BOX box = { (UINT)bd.Width / 2, bd.Height / 2, 0, (UINT)bd.Width / 2 + 1, bd.Height / 2 + 1, 1 };
@@ -629,12 +754,21 @@ int rg_present_clear(const float* rgba) {
                         WriteFile(f, hdr, 54, &wr, NULL);
                         for (UINT y = 0; y < hgt; y++) WriteFile(f, p + (size_t)y * pitch, w * 4, &wr, NULL);
                         CloseHandle(f); rlog("screenshot of frame %d -> %s", frame, path);
+                        rt_dump_write(frame);
                     }
                 }
             }
             D3D12_RANGE z = { 0, 0 }; ID3D12Resource_Unmap(rb, 0, &z);
         }
     }
+    {   static ID3D12InfoQueue* iq; static int tried, shown;      /* D3D12 debug layer (GTA6_D3D_DEBUG=1): log its messages */
+        if (!tried) { tried = 1; if (FAILED(ID3D12Device_QueryInterface(g_dev, &IID_ID3D12InfoQueue, (void**)&iq))) iq = NULL; }
+        if (iq) { UINT64 n = ID3D12InfoQueue_GetNumStoredMessages(iq);
+            for (UINT64 k = 0; k < n && shown < 60; k++) { SIZE_T len = 0; ID3D12InfoQueue_GetMessage(iq, k, NULL, &len);
+                D3D12_MESSAGE* msg = (D3D12_MESSAGE*)malloc(len); if (msg && SUCCEEDED(ID3D12InfoQueue_GetMessage(iq, k, msg, &len)) && msg->Severity <= D3D12_MESSAGE_SEVERITY_WARNING) { rlog("d3d12 debug [%d]: %.480s", msg->ID, msg->pDescription); shown++; } free(msg); }
+            ID3D12InfoQueue_ClearStoredMessages(iq); }
+    }
+    ReleaseSRWLockExclusive(&g_gpulk);
     static int bad; if (FAILED(hr) && bad++ < 5) rlog("Present failed 0x%08lX", hr);
     return SUCCEEDED(hr);
 }

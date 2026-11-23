@@ -88,7 +88,8 @@ typedef struct { void* p; int parent, slot, kind; GUID iid; void* aux; void* met
    Command lists keep a record buffer: {u32 slot, u32 nextra, u64 a[6]} followed by nextra extra dwords (copied data).
    Pipeline objects keep meta = PsoMeta (shader code, size, hash, copy of the creation desc). */
 typedef struct { int n; uint8_t kind[64]; uint16_t val[64]; } RootLayout;   /* root signature parameters (rg_rootsig_info) */
-typedef struct { uint64_t code, size, hash; uint8_t desc[0x180]; uint32_t regs[7]; int hasregs; const void* vs; const void* ps; size_t vslen, pslen; uint64_t vhash, phash; } PsoMeta;
+typedef struct { uint64_t code, size, hash; uint8_t desc[0x180]; uint32_t regs[7]; int hasregs; const void* vs; const void* ps; size_t vslen, pslen; uint64_t vhash, phash;
+                 int ncb; uint32_t cboff[16], cbreg[16], cbkind[16]; } PsoMeta;   /* ncb..: table slots (dword offset) the runtime fills with CBV descriptors */
 void rg_queue_xlat_draw(uint64_t vh, uint64_t ph, const uint32_t* vsc, const uint32_t* psc, uint32_t verts, uint32_t insts, int prim, const float* vp, int rt);
 int rg_rt(uint64_t addr, unsigned w, unsigned h, unsigned fmt);
 int rg_rt_srv(uint64_t addr);
@@ -404,6 +405,7 @@ static void replay_list(int lid) {
     CmdRec* r = (CmdRec*)g_obj[lid].meta;
     int pso = -1, rootsig = -1; uint64_t tables[16] = { 0 }, views[16] = { 0 }, heaps[2] = { 0 }; uint32_t consts[16][64]; uint32_t cmask[16] = { 0 };
     float gvp[6] = { 0, 0, 3840, 2160, 0, 1 }; uint64_t groot0 = 0;
+    uint64_t gvk[3][16] = { 0 };   /* root views by kind: [0] CBV (42), [1] SRV (44), [2] UAV (46) */
     int gprim = 4, grt = -1; int grs = -1; uint64_t gtab[16] = { 0 }, gview[16] = { 0 }; uint32_t gconst[16][64] = { 0 }; uint32_t gib[4] = { 0 }; uint32_t gvb[32][4] = { 0 };   /* graphics root + IA state */
     static volatile LONG logged; static uint64_t seen[4096]; static LONG nseen;
     for (size_t off = 0; off + sizeof(RecHdr) <= r->used;) {
@@ -449,11 +451,34 @@ static void replay_list(int lid) {
         if ((h->slot == 12 || h->slot == 13) && pso > 0 && g_obj[pso].slot == 57) {   /* GTA6_DRAWLOG: main-renderer draw state, first 12 draws */
             static volatile LONG nlog; static int want = -1; if (want < 0) want = GetEnvironmentVariableA("GTA6_DRAWLOG", NULL, 0) ? 1 : 0;
             LONG my; PsoMeta* pm = (PsoMeta*)g_obj[pso].meta;
-            if (want && pm && (my = InterlockedIncrement(&nlog)) <= 12) {
+            int pick = 0;                                         /* first 3 draws of each distinct shader pair */
+            if (want && pm) { static uint64_t pk[256]; static int pc[256], npk; static SRWLOCK lk = SRWLOCK_INIT; uint64_t key = pm->vhash ^ (pm->phash * 31);
+                AcquireSRWLockExclusive(&lk); int j = 0; for (; j < npk; j++) if (pk[j] == key) break;
+                if (j == npk && npk < 256) { pk[npk] = key; pc[npk] = 0; npk++; }
+                if (j < npk && pc[j]++ < 3) pick = 1; ReleaseSRWLockExclusive(&lk); }
+            if (pick && (my = InterlockedIncrement(&nlog)) <= 200) {
                 dlog("DRAWLOG #%ld m%u(%llX %llX %llX %llX %llX) vs %016llX ps %016llX rootsig obj#%d", my, h->slot, h->a[0], h->a[1], h->a[2], h->a[3], h->a[4], pm->vhash, pm->phash, grs);
                 dlog("DRAWLOG   tables %llX %llX %llX %llX  views %llX %llX  consts1 %08X %08X  ib %08X%08X size %X fmt %X",
                     gtab[0], gtab[1], gtab[2], gtab[3], gview[0], gview[1], gconst[1][0], gconst[1][1], gib[1], gib[0], gib[2], gib[3]);
-                for (int v = 0; v < 4; v++) if (gvb[v][0] || gvb[v][1]) dlog("DRAWLOG   vb%d addr %08X%08X size %X stride %X", v, gvb[v][1], gvb[v][0], gvb[v][2], gvb[v][3]);
+                for (int v = 0; v < 4; v++) if (gvb[v][0] || gvb[v][1]) {
+                    uint64_t va = ((uint64_t)gvb[v][1] << 32) | gvb[v][0];
+                    dlog("DRAWLOG   vb%d addr %08X%08X size %X stride %X  first bytes: %s", v, gvb[v][1], gvb[v][0], gvb[v][2], gvb[v][3], hx(va, 48)); }
+                if (gib[0] || gib[1]) { uint64_t ia = ((uint64_t)gib[1] << 32) | gib[0]; dlog("DRAWLOG   ib first bytes (start index %u): %s", (uint32_t)h->a[2], hx(ia, 32)); }
+                if (gvk[1][0] && readable(gvk[1][0], 128)) {   /* the root SRV address (list slot 44) as floats */
+                    const float* fv = (const float*)gvk[1][0];
+                    dlog("DRAWLOG   root SRV %llX floats: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g || +0x40: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", gvk[1][0],
+                        fv[0], fv[1], fv[2], fv[3], fv[4], fv[5], fv[6], fv[7], fv[8], fv[9], fv[10], fv[11], fv[12], fv[13], fv[14], fv[15],
+                        fv[16], fv[17], fv[18], fv[19], fv[20], fv[21], fv[22], fv[23], fv[24], fv[25], fv[26], fv[27], fv[28], fv[29], fv[30], fv[31]);
+                }
+                {   /* CPU view of the buffers behind table entries 0 and 2 (+0x40): descriptor, then data at +0 and +0x160 */
+                    uint64_t c = gpu2cpu(gtab[0]);
+                    for (int e = 0; e < 3 && gtab[0] && readable(c, 0x60); e += 2) {
+                        const uint32_t* d = (const uint32_t*)(c + (uint64_t)e * 32);
+                        uint64_t bb = (uint64_t)d[0] | ((uint64_t)(d[1] & 0xFFFF) << 32);
+                        dlog("DRAWLOG   entry %d V#: %08X %08X %08X %08X -> base %llX%s  data+0: %s  data+0x160: %s", e, d[0], d[1], d[2], d[3], bb,
+                            gmem() && gmem()->dir[(bb >> 32) & 0xFFFF] && gmem()->dir[(bb >> 32) & 0xFFFF][(bb >> 16) & 0xFFFF] ? " (pool)" : " (NOT pool)", hx(bb, 32), hx(bb + 0x160, 32));
+                    }
+                }
                 {   /* every image descriptor (T#) among the first 16 entries of table 0, decoded */
                     uint64_t c = gpu2cpu(gtab[0]);
                     if (gtab[0] && readable(c, 16 * 32)) for (int e = 0; e < 16; e++) {
@@ -506,6 +531,23 @@ static void replay_list(int lid) {
                     else { vsc[0] = (uint32_t)(uint64_t)tbl; vsc[1] = (uint32_t)((uint64_t)tbl >> 32) & 0xFF; }
                     vsc[2] = (uint32_t)(indexed ? h->a[3] : h->a[2]); vsc[3] = (uint32_t)(indexed ? h->a[4] : h->a[3]);
                     vsc[8] = psc[8] = (uint32_t)gtab[0];
+                    if (gm->ncb && gtab[0]) {                  /* runtime step: root CBV / buffer SRV descriptors into the per-draw table */
+                        uint64_t tc = gpu2cpu(gtab[0]);
+                        for (int k = 0; k < gm->ncb; k++) {
+                            uint32_t* e = (uint32_t*)(tc + (uint64_t)gm->cboff[k] * 4);
+                            uint64_t src = 0; int kk = gm->cbkind[k] == 0x300 ? 1 : 0;
+                            for (int pi = 0; pi < 16 && !src; pi++) src = gvk[kk][pi];
+                            if (kk && GetEnvironmentVariableA("GTA6_SRV_FROM_CB", NULL, 0)) {   /* experiment: buffer SRV from the table's CBV descriptor */
+                                for (int k2 = 0; k2 < gm->ncb; k2++) if (gm->cbkind[k2] == 0x302) { const uint32_t* cbd = (const uint32_t*)(tc + (uint64_t)gm->cboff[k2] * 4);
+                                    if (readable((uint64_t)cbd, 16) && (cbd[0] || cbd[1])) { memcpy(e, cbd, 16); src = 0; break; } }
+                                if (e[0] || e[1]) { static volatile LONG nx; if (InterlockedIncrement(&nx) <= 3) dlog("SRV from CBV descriptor: table %llX dword %u", gtab[0], gm->cboff[k]); continue; }
+                            }
+                            if (!src || !writable((uint64_t)e, 16) || e[0] || e[1] || e[2] || e[3]) continue;
+                            e[0] = (uint32_t)src; e[1] = (uint32_t)(src >> 32) & 0xFFFF; e[2] = 0x10000; e[3] = 0x0002403C;
+                            static volatile LONG nl; if (InterlockedIncrement(&nl) <= 8) dlog("%s fill: table %llX dword %u (%c%u) <- %llX  [root views: cbv %llX srv %llX uav %llX]", kk ? "SRV" : "CBV",
+                                gtab[0], gm->cboff[k], kk ? 't' : 'b', gm->cbreg[k], src, gvk[0][0], gvk[1][0], gvk[2][0]);
+                        }
+                    }
                     tex_bindings(gtab[0], psc); tex_bindings(gtab[0], vsc);
                     if (indexed) {                                        /* index buffer view {address, size, format}; 42 = R32_UINT */
                         uint64_t ib = ((uint64_t)gib[1] << 32) | gib[0]; int i32 = (gib[3] == 42);
@@ -538,7 +580,7 @@ static void replay_list(int lid) {
         case 36: if (h->a[0] < 16) gtab[h->a[0]] = h->a[1]; break;              /* SetGraphicsRootDescriptorTable (GPU handle, low alias) */
         case 38: if (h->a[0] < 16 && h->a[2] < 64) gconst[h->a[0]][h->a[2]] = (uint32_t)h->a[1]; break;
         case 40: if (h->a[0] < 16) for (uint32_t i = 0; i < h->nextra && h->a[3] + i < 64; i++) gconst[h->a[0]][h->a[3] + i] = ex[i]; break;
-        case 42: case 44: case 46: if (h->a[0] < 16) gview[h->a[0]] = h->a[1]; break;   /* Set Graphics Root CBV / SRV / UAV */
+        case 42: case 44: case 46: if (h->a[0] < 16) { gview[h->a[0]] = h->a[1]; gvk[h->slot == 42 ? 0 : h->slot == 44 ? 1 : 2][h->a[0]] = h->a[1]; } break;   /* Set Graphics Root CBV / SRV / UAV */
         case 47: if (h->nextra == 4) memcpy(gib, ex, 16); break;
         case 48: for (uint32_t i = 0; i < h->nextra / 4 && h->a[0] + i < 32; i++) memcpy(gvb[h->a[0] + i], ex + i * 4, 16); break;
         case 41: case 43: case 45: if (h->a[0] < 16) views[h->a[0]] = h->a[1]; break;
@@ -588,6 +630,45 @@ static DWORD WINAPI rate_dumper(void* unused) {
         if (k) dlog("RATE(5s):%s", line);
     }
     return 0;
+}
+/* fence value lives inside the fence object at +0x100 so its address can be handed out (Xbox fence slot 12) */
+#define FENCEVAL(i) (*(volatile uint64_t*)((uint8_t*)g_obj[i].p + 0x100))
+/* SetEventOnCompletion waiters: fire only when the fence actually reaches the value */
+static struct { int fence; uint64_t value; HANDLE ev; } waiters[4096]; static LONG nwait; static SRWLOCK wlk = SRWLOCK_INIT;
+#define FENCE_SET(i, val) do { int fi_ = (i); uint64_t v_ = (val); FENCEVAL(fi_) = v_; \
+    AcquireSRWLockExclusive(&wlk); for (LONG k_ = 0; k_ < nwait;) { if (waiters[k_].fence == fi_ && waiters[k_].value <= v_) { SetEvent(waiters[k_].ev); waiters[k_] = waiters[--nwait]; } else k_++; } \
+    ReleaseSRWLockExclusive(&wlk); } while (0)
+
+/* ---- fences that wait for the real GPU (translated work submitted at ExecuteCommandLists, rg_submit) ----
+   A queue Signal(fence, value) after real GPU work completes only when the real GPU has passed that work, so the
+   title doesn't recycle per-draw memory (root tables, vertex data) that the GPU still has to read. */
+uint64_t rg_submit(void);
+uint64_t rg_completed(void);
+void rg_wait(uint64_t v, DWORD ms);
+static struct { int fence; uint64_t value, gpu; } g_pend[8192]; static LONG g_npend; static SRWLOCK g_pendlk = SRWLOCK_INIT;
+static volatile uint64_t g_lastgpu;                 /* last real-GPU fence value a queue submission produced */
+static HANDLE g_pendev;
+static void fence_set(int i, uint64_t v) { FENCE_SET(i, v); }
+static DWORD WINAPI pend_thread(LPVOID u) {
+    (void)u;
+    for (;;) {
+        WaitForSingleObject(g_pendev, 2);
+        uint64_t done = rg_completed();
+        AcquireSRWLockExclusive(&g_pendlk);
+        for (LONG k = 0; k < g_npend;) {                 /* in order: entries were appended in signal order */
+            if (g_pend[k].gpu <= done) { fence_set(g_pend[k].fence, g_pend[k].value); memmove(&g_pend[k], &g_pend[k + 1], (size_t)(g_npend - k - 1) * sizeof g_pend[0]); g_npend--; }
+            else k++;
+        }
+        ReleaseSRWLockExclusive(&g_pendlk);
+    }
+}
+static void fence_signal(int f, uint64_t v) {
+    uint64_t gpu = g_lastgpu;
+    if (!gpu || rg_completed() >= gpu) { fence_set(f, v); return; }
+    static volatile LONG started; if (!InterlockedExchange(&started, 1)) { g_pendev = CreateEventA(NULL, FALSE, FALSE, NULL); HANDLE th = CreateThread(NULL, 0, pend_thread, NULL, 0, NULL); if (th) CloseHandle(th); }
+    AcquireSRWLockExclusive(&g_pendlk);
+    if (g_npend < 8192) { g_pend[g_npend].fence = f; g_pend[g_npend].value = v; g_pend[g_npend].gpu = gpu; g_npend++; ReleaseSRWLockExclusive(&g_pendlk); }
+    else { ReleaseSRWLockExclusive(&g_pendlk); rg_wait(gpu, 1000); fence_set(f, v); }
 }
 static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
     /* normal call: rcx = this. struct-return call: rcx = return buffer, a[0] = this. */
@@ -695,13 +776,6 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
     int isres = (id > 0 && g_obj[id].iid.Data1 == 0x696442BE);    /* ID3D12Resource */
     int isfence = (id > 0 && g_obj[id].iid.Data1 == 0x0A753DCF);  /* ID3D12Fence: value lives in aux */
     int isqueue = (id > 0 && g_obj[id].iid.Data1 == 0x0EC870A6);  /* ID3D12CommandQueue */
-    /* fence value lives inside the fence object at +0x100 so its address can be handed out (Xbox fence slot 12) */
-    #define FENCEVAL(i) (*(volatile uint64_t*)((uint8_t*)g_obj[i].p + 0x100))
-    /* SetEventOnCompletion waiters: fire only when the fence actually reaches the value */
-    static struct { int fence; uint64_t value; HANDLE ev; } waiters[4096]; static LONG nwait; static SRWLOCK wlk = SRWLOCK_INIT;
-    #define FENCE_SET(i, val) do { int fi_ = (i); uint64_t v_ = (val); FENCEVAL(fi_) = v_; \
-        AcquireSRWLockExclusive(&wlk); for (LONG k_ = 0; k_ < nwait;) { if (waiters[k_].fence == fi_ && waiters[k_].value <= v_) { SetEvent(waiters[k_].ev); waiters[k_] = waiters[--nwait]; } else k_++; } \
-        ReleaseSRWLockExclusive(&wlk); } while (0)
     if (id == 0 && slot == 36 && !sret) {                        /* CreateFence(initial, flags, riid, ppv): seed value */
         int f = objid(writable(arg[3], 8) ? *(uint64_t*)arg[3] : 0);
         if (f > 0) FENCEVAL(f) = arg[0];
@@ -849,6 +923,17 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
                 PsoMeta* m = (PsoMeta*)g_obj[po].meta;
                 if (!m) { m = (PsoMeta*)calloc(1, sizeof(PsoMeta) + 16 * 0x100); g_obj[po].meta = m; if (m) m->hash = 0x6700000000000000ull | 57; }
                 if (m) { if (!st) { m->ps = (const void*)bp; m->pslen = (size_t)bl; m->phash = hh; } else { m->vs = (const void*)bp; m->vslen = (size_t)bl; m->vhash = hh; } }
+                /* stage metadata (PS +0x38/+0x40, VS +0x58/+0x60): header, then 32-byte records {tag, kind, offset, register, ...};
+                   tag 0x41 kind 0x302 = "descriptor of constant buffer <register> goes at dword <offset> of the s8 table" */
+                uint64_t mp = q[7 + st * 4], ml = q[8 + st * 4];
+                if (m && ml >= 16 && ml < 0x2000 && readable(mp, (size_t)ml)) {
+                    const uint32_t* w = (const uint32_t*)mp;
+                    for (uint64_t r = 4; r + 8 <= ml / 4 && w[r] != 0x43; r += 8)
+                        if (w[r] == 0x41 && (w[r + 1] == 0x302 || w[r + 1] == 0x300) && m->ncb < 16) {   /* 0x302 CBV, 0x300 buffer SRV */
+                            int dup = 0; for (int k = 0; k < m->ncb; k++) if (m->cboff[k] == w[r + 2]) dup = 1;
+                            if (!dup) { m->cboff[m->ncb] = w[r + 2]; m->cbreg[m->ncb] = w[r + 3]; m->cbkind[m->ncb] = w[r + 1]; m->ncb++; }
+                        }
+                }
             }
         }
     }
@@ -1034,13 +1119,14 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
             int lo = objid(((uint64_t*)arg[1])[li]); replay_list(lo); lists++;
             if (lo > 0 && g_obj[lo].meta) recs += (LONGLONG)(((CmdRec*)g_obj[lo].meta)->used / sizeof(RecHdr));
         }
+        if (!noreplay && g_xlat_on > 0) { uint64_t v = rg_submit(); if (v) g_lastgpu = v; }      /* translated work goes to the real GPU now */
         QueryPerformanceCounter(&t1); spent += t1.QuadPart - t0.QuadPart;
         if (GetTickCount64() - lastrep > 5000) { lastrep = GetTickCount64();
             dlog("REPLAY cost: %.1f ms over the last 5 s, %lld lists, ~%lld records", spent * 1000.0 / qf.QuadPart, lists, recs); spent = lists = recs = 0; }
     }
     if (isqueue && !sret && slot == 16) {                        /* Xbox queue Signal(fence, value): commands "finish" instantly */
         int f = objid(arg[0]);
-        if (f > 0 && g_obj[f].iid.Data1 == 0x0A753DCF) FENCE_SET(f, arg[1]);
+        if (f > 0 && g_obj[f].iid.Data1 == 0x0A753DCF) fence_signal(f, arg[1]);
         return 0;
     }
     if (isheap && (slot == 9 || slot == 10)) {                   /* Get CPU/GPU DescriptorHandleForHeapStart */

@@ -189,7 +189,7 @@ def translate(spec, code, stage, nuser):
             br = {"S_BRANCH": "true", "S_CBRANCH_SCC0": "scc == 0u", "S_CBRANCH_SCC1": "scc != 0u", "S_CBRANCH_VCCZ": "vcc == 0",
                   "S_CBRANCH_VCCNZ": "vcc != 0", "S_CBRANCH_EXECZ": "exec == 0", "S_CBRANCH_EXECNZ": "exec != 0"}
             if nm in br: s = "if (%s) { pc = 0x%X; continue; }" % (br[nm], tgt)
-            elif nm == "S_ENDPGM": s = "return o;"
+            elif nm == "S_ENDPGM": s = "RET;"
             elif nm in ("S_NOP", "S_WAITCNT", "S_CLAUSE", "S_INST_PREFETCH", "S_CODE_END", "S_SETPRIO", "S_DCACHE_INV", "S_SLEEP", "S_TTRACEDATA",
                         "S_SENDMSG", "S_SENDMSGHALT", "S_BARRIER", "S_ICACHE_INV", "S_WAITCNT_DEPCTR", "S_DENORM_MODE", "S_ROUND_MODE", "S_SETHALT"): s = ""
             else: raise Unsupported(nm)
@@ -306,7 +306,9 @@ def translate(spec, code, stage, nuser):
             if nm in loads:
                 c = loads[nm]; maxv = max(maxv, vdata + c)
                 fmt = "FORMAT" in nm
-                if fmt: s = "if (ACT) { uint64_t a_ = %s; float4 f_ = fmtload(a_, s[%d]); %s }" % (addr, srsrc + 3, " ".join("v[%d] = asuint(f_[%d]);" % (vdata + i, i) for i in range(c)))
+                if fmt:   # format: MTBUF carries it in the instruction (dword0 [25:19]); MUBUF *_FORMAT_* take it from the V# (dword3 [18:12])
+                    fexpr = "%du" % ((d0 >> 19) & 0x7F) if is_t else "((s[%d] >> 12) & 127u)" % (srsrc + 3)
+                    s = "if (ACT) { uint64_t a_ = %s; float4 f_ = fmtload(a_, %s); %s }" % (addr, fexpr, " ".join("v[%d] = asuint(f_[%d]);" % (vdata + i, i) for i in range(c)))
                 else: s = "if (ACT) { uint64_t a_ = %s; %s }" % (addr, " ".join("v[%d] = memload(a_ + %du);" % (vdata + i, 4 * i) for i in range(c)))
             elif nm.startswith("BUFFER_STORE") or nm.startswith("TBUFFER_STORE") or nm.startswith("BUFFER_ATOMIC"): s = ""   # no writes to game memory from VS/PS yet
             elif nm in ("BUFFER_LOAD_UBYTE", "BUFFER_LOAD_USHORT", "BUFFER_LOAD_SBYTE", "BUFFER_LOAD_SSHORT"):
@@ -529,7 +531,50 @@ float cubeid(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = a
 float cubesc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); return az >= ax && az >= ay ? (z < 0 ? -x : x) : (ay >= ax ? x : (x < 0 ? z : -z)); }
 float cubetc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); return az >= ax && az >= ay ? -y : (ay >= ax ? (y < 0 ? -z : z) : -y); }
 bool fclass(float f, uint m) { return (m != 0u); }
-float4 fmtload(uint64_t off, uint w3) { return float4(asfloat(memload(off)), asfloat(memload(off + 4u)), asfloat(memload(off + 8u)), asfloat(memload(off + 12u))); }
+uint memload_u(uint64_t a) { uint sh = 8u * (uint)(a & 3ull); uint lo = memload(a); if (sh == 0u) return lo; return (lo >> sh) | (memload(a + 4ull) << (32u - sh)); }   // unaligned dword
+float unorm8(uint v, uint i) { return (float)((v >> (8u * i)) & 255u) / 255.0f; }
+float snorm8(uint v, uint i) { return max((float)((int)(v << (24u - 8u * i)) >> 24) / 127.0f, -1.0f); }
+float unorm16(uint v, uint i) { return (float)((v >> (16u * i)) & 0xFFFFu) / 65535.0f; }
+float snorm16(uint v, uint i) { return max((float)((int)(v << (16u - 16u * i)) >> 16) / 32767.0f, -1.0f); }
+// formatted vertex/buffer fetch; f = GFX10 unified format (LLVM UfmtGFX10 numbering). Integer formats return the integer bits.
+float4 fmtload(uint64_t a, uint f) {
+    uint x = memload_u(a), y = (f >= 62u) ? memload_u(a + 4ull) : 0u;
+    switch (f) {
+    case 1u:  return float4(unorm8(x, 0), 0, 0, 1);
+    case 2u:  return float4(snorm8(x, 0), 0, 0, 1);
+    case 5u:  return float4(asfloat(x & 255u), 0, 0, asfloat(1u));
+    case 6u:  return float4(asfloat(asuint((int)(x << 24) >> 24)), 0, 0, asfloat(1u));
+    case 7u:  return float4(unorm16(x, 0), 0, 0, 1);
+    case 8u:  return float4(snorm16(x, 0), 0, 0, 1);
+    case 11u: return float4(asfloat(x & 0xFFFFu), 0, 0, asfloat(1u));
+    case 12u: return float4(asfloat(asuint((int)(x << 16) >> 16)), 0, 0, asfloat(1u));
+    case 13u: return float4(f16tof32(x), 0, 0, 1);
+    case 14u: return float4(unorm8(x, 0), unorm8(x, 1), 0, 1);
+    case 15u: return float4(snorm8(x, 0), snorm8(x, 1), 0, 1);
+    case 18u: return float4(asfloat(x & 255u), asfloat((x >> 8) & 255u), 0, asfloat(1u));
+    case 20u: case 21u: return float4(asfloat(x), 0, 0, asfloat(1u));
+    case 22u: return float4(asfloat(x), 0, 0, 1);
+    case 23u: return float4(unorm16(x, 0), unorm16(x, 1), 0, 1);
+    case 24u: return float4(snorm16(x, 0), snorm16(x, 1), 0, 1);
+    case 27u: return float4(asfloat(x & 0xFFFFu), asfloat(x >> 16), 0, asfloat(1u));
+    case 28u: return float4(asfloat(asuint((int)(x << 16) >> 16)), asfloat(asuint((int)x >> 16)), 0, asfloat(1u));
+    case 29u: return float4(f16tof32(x), f16tof32(x >> 16), 0, 1);
+    case 44u: return float4((x & 1023u) / 1023.0f, ((x >> 10) & 1023u) / 1023.0f, ((x >> 20) & 1023u) / 1023.0f, (x >> 30) / 3.0f);
+    case 56u: return float4(unorm8(x, 0), unorm8(x, 1), unorm8(x, 2), unorm8(x, 3));
+    case 57u: return float4(snorm8(x, 0), snorm8(x, 1), snorm8(x, 2), snorm8(x, 3));
+    case 60u: return float4(asfloat(x & 255u), asfloat((x >> 8) & 255u), asfloat((x >> 16) & 255u), asfloat(x >> 24));
+    case 62u: case 63u: return float4(asfloat(x), asfloat(y), 0, asfloat(1u));
+    case 64u: return float4(asfloat(x), asfloat(y), 0, 1);
+    case 65u: return float4(unorm16(x, 0), unorm16(x, 1), unorm16(y, 0), unorm16(y, 1));
+    case 66u: return float4(snorm16(x, 0), snorm16(x, 1), snorm16(y, 0), snorm16(y, 1));
+    case 69u: return float4(asfloat(x & 0xFFFFu), asfloat(x >> 16), asfloat(y & 0xFFFFu), asfloat(y >> 16));
+    case 71u: return float4(f16tof32(x), f16tof32(x >> 16), f16tof32(y), f16tof32(y >> 16));
+    case 72u: case 73u: return float4(asfloat(x), asfloat(y), asfloat(memload_u(a + 8ull)), asfloat(1u));
+    case 74u: return float4(asfloat(x), asfloat(y), asfloat(memload_u(a + 8ull)), 1);
+    case 75u: case 76u: case 77u: return float4(asfloat(x), asfloat(y), asfloat(memload_u(a + 8ull)), asfloat(memload_u(a + 12ull)));
+    default:  return float4(asfloat(x), asfloat(y), asfloat(memload_u(a + 8ull)), asfloat(memload_u(a + 12ull)));
+    }
+}
 """
     if stage == "vs":
         io = "struct VSOut { float4 pos : SV_Position; %s };\n" % " ".join("uint4 attr%d : TEXCOORD%d;" % (i, i) for i in range(NATTR))
@@ -548,7 +593,13 @@ float4 fmtload(uint64_t off, uint w3) { return float4(asfloat(memload(off)), asf
     entry += "    [unroll] for (int i = 0; i < %d; i++) s[i] = 0u; [unroll] for (int j = 0; j < %d; j++) v[j] = 0u;\n" % (ns, nv)
     entry += "    [unroll] for (int u = 0; u < %d; u++) s[u] = g_user[u >> 2][u & 3];\n" % min(nuser, 32) + init_v
     macros = "#define ACT (((exec >> lane) & 1ull) != 0)\n#define VCCLO ((uint)vcc)\n#define VCCHI ((uint)(vcc >> 32))\n#define EXECLO ((uint)exec)\n#define EXECHI ((uint)(exec >> 32))\n"
-    loop = "    uint pc = 0u;\n    [loop] for (uint guard = 0u; guard < 200000u; guard++) {\n    switch (pc) {\n" + body + "\n        return o;\n    default: return o;\n    }\n    }\n    return o;\n}\n"
+    loop = "    uint pc = 0u;\n    [loop] for (uint guard = 0u; guard < 200000u; guard++) {\n    switch (pc) {\n" + body + "\n        RET;\n    default: RET;\n    }\n    }\n    RET;\n}\n"
+    if stage == "vs":   # debug (g_draw.w != 0): vertices 0..2 report their position, vertex 0 its first attribute and user SGPRs
+        macros += ("RWByteAddressBuffer g_dbg : register(u0);\n"
+                   "#define RET { if (g_draw.w != 0u && vid < 3u) { g_dbg.Store4(vid * 16u, asuint(o.pos)); if (vid == 0u) { g_dbg.Store4(48u, o.attr0);"
+                   " [unroll] for (uint k_ = 0u; k_ < 16u; k_++) g_dbg.Store(64u + 4u * k_, s[k_]); } } return o; }\n")
+    else:
+        macros += "#define RET return o\n"
     hdr = hdr.replace("REGS_SLOT", "b0" if stage == "vs" else "b1")
     return hdr + macros + io + entry + loop
 
