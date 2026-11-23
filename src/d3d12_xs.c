@@ -83,7 +83,8 @@ typedef struct { void* p; int parent, slot, kind; GUID iid; void* aux; void* met
 /* ---- command recording (emulator step 1) ----
    Command lists keep a record buffer: {u32 slot, u32 nextra, u64 a[6]} followed by nextra extra dwords (copied data).
    Pipeline objects keep meta = PsoMeta (shader code, size, hash, copy of the creation desc). */
-typedef struct { uint64_t code, size, hash; uint8_t desc[0x180]; uint32_t regs[7]; int hasregs; } PsoMeta;
+typedef struct { uint64_t code, size, hash; uint8_t desc[0x180]; uint32_t regs[7]; int hasregs; const void* vs; const void* ps; size_t vslen, pslen; } PsoMeta;
+void rg_queue_dxil_draw(const void* vs, size_t vslen, const void* ps, size_t pslen, const void* srv, uint32_t srvlen, uint32_t verts, uint32_t insts, const float* vp);
 typedef struct { uint8_t* buf; size_t used, cap; } CmdRec;
 /* Resources keep meta = ResMeta (their D3D12_RESOURCE_DESC); memory stays in aux. */
 typedef struct { uint8_t desc[56]; uint64_t size; } ResMeta;
@@ -105,6 +106,21 @@ static void write_timg(uint32_t* d, uint64_t base, uint32_t dxgi, uint32_t w, ui
     d[4] = (depth ? depth - 1 : 0) & 0x1FFF;
 }
 static volatile LONG g_desclog;
+/* render-target view handle -> resource object; last clear colour per resource (from replayed ClearRenderTargetView) */
+#define RTVMAP 65536
+static struct { uint64_t handle; int res; } g_rtv[RTVMAP];
+static struct { int res; float rgba[4]; LONG frame; } g_clear[4096]; static LONG g_nclear;
+static void rtv_set(uint64_t handle, int res) { uint32_t i = (uint32_t)((handle >> 5) * 2654435761u) & (RTVMAP - 1);
+    for (int n = 0; n < 64; n++, i = (i + 1) & (RTVMAP - 1)) if (!g_rtv[i].handle || g_rtv[i].handle == handle) { g_rtv[i].handle = handle; g_rtv[i].res = res; return; } }
+static int rtv_get(uint64_t handle) { uint32_t i = (uint32_t)((handle >> 5) * 2654435761u) & (RTVMAP - 1);
+    for (int n = 0; n < 64; n++, i = (i + 1) & (RTVMAP - 1)) { if (g_rtv[i].handle == handle) return g_rtv[i].res; if (!g_rtv[i].handle) return -1; } return -1; }
+static void clear_set(int res, const float* c) {
+    for (LONG i = 0; i < g_nclear; i++) if (g_clear[i].res == res) { memcpy(g_clear[i].rgba, c, 16); return; }
+    if (g_nclear < 4096) { g_clear[g_nclear].res = res; memcpy(g_clear[g_nclear].rgba, c, 16); g_nclear++; }
+}
+static const float* clear_get(int res) { for (LONG i = 0; i < g_nclear; i++) if (g_clear[i].res == res) return g_clear[i].rgba; return NULL; }
+int rg_init(HWND hwnd);
+int rg_present_clear(const float* rgba);
 typedef struct { uint32_t slot, nextra; uint64_t a[6]; } RecHdr;
 static ObjInfo* g_obj;             /* MAXOBJ entries, allocated on first use */
 static void* g_dxgidev;
@@ -302,6 +318,7 @@ static void replay_list(int lid) {
     if (lid <= 0 || !g_obj[lid].meta) return;
     CmdRec* r = (CmdRec*)g_obj[lid].meta;
     int pso = -1, rootsig = -1; uint64_t tables[16] = { 0 }, views[16] = { 0 }, heaps[2] = { 0 }; uint32_t consts[16][64]; uint32_t cmask[16] = { 0 };
+    float gvp[6] = { 0, 0, 3840, 2160, 0, 1 }; uint64_t groot0 = 0;
     static volatile LONG logged; static uint64_t seen[4096]; static LONG nseen;
     for (size_t off = 0; off + sizeof(RecHdr) <= r->used;) {
         RecHdr* h = (RecHdr*)(r->buf + off); const uint32_t* ex = (const uint32_t*)(h + 1);
@@ -335,6 +352,17 @@ static void replay_list(int lid) {
                     dlog("   m%u (%llX, %llX, %llX, %llX) %s%s %s", q->slot, q->a[0], q->a[1], q->a[2], q->a[3], qo > 0 ? "[obj] " : "", q->nextra ? "data:" : "", ex2);
                     o2 += sizeof(RecHdr) + (size_t)q->nextra * 4;
                 }
+            }
+        }
+        if (h->slot == 52 && h->nextra == 4) { int rr = rtv_get(h->a[0]); if (rr > 0) clear_set(rr, (const float*)ex); }
+        /* graphics state for real-GPU draws */
+        if (h->slot == 21 && h->nextra == 6) memcpy(gvp, ex, 24);
+        if (h->slot == 44 && h->a[0] == 0) groot0 = h->a[1];                      /* Xbox: SetGraphicsRootShaderResourceView(0, va) */
+        if ((h->slot == 12) && pso > 0) {
+            PsoMeta* gm = (PsoMeta*)g_obj[pso].meta;
+            if (gm && gm->vs && gm->ps && readable(groot0, 256)) {
+                uint32_t len = readable(groot0, 4096) ? 4096 : 256;
+                rg_queue_dxil_draw(gm->vs, gm->vslen, gm->ps, gm->pslen, (const void*)groot0, len, (uint32_t)h->a[0], (uint32_t)h->a[1], gvp);
             }
         }
         switch (h->slot) {
@@ -543,6 +571,13 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
                 if (k > 520) break;
             }
             if (InterlockedIncrement(&shown) <= 6) dlog("PSOSTREAM size=0x%llX:%s", ssize, line);
+            /* keep the VS/PS bytecode (subobjects 1 and 2 sit at stream +0x10 / +0x28) on the pipeline object */
+            int po = writable(arg[2], 8) ? objid(*(uint64_t*)arg[2]) : -1;
+            if (po > 0 && ssize >= 0x38 && *(const uint32_t*)(s + 0x10) == 1 && *(const uint32_t*)(s + 0x28) == 2) {
+                PsoMeta* m = (PsoMeta*)g_obj[po].meta;
+                if (!m) { m = (PsoMeta*)calloc(1, sizeof(PsoMeta) + 16 * 0x100); g_obj[po].meta = m; if (m) m->hash = 0x6700000000000000ull | 86; }
+                if (m) { m->vs = *(const void* const*)(s + 0x18); m->vslen = *(const uint64_t*)(s + 0x20); m->ps = *(const void* const*)(s + 0x30); m->pslen = *(const uint64_t*)(s + 0x38); }
+            }
         }
     }
     /* graphics/other pipeline creators (55, 57, 62, 86): keep a copy of the description + what its pointers point at */
@@ -628,7 +663,13 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
             uint64_t arr = ((uint64_t*)arg[1])[2]; int ro = readable(arr, 8) ? objid(*(uint64_t*)arr) : -1;
             uint32_t w = 3840, h = 2160;
             if (readable(arg[2], 0x30)) { uint32_t* rc = (uint32_t*)(arg[2] + 0x28); if (rc[0] && rc[1] && rc[0] <= 8192 && rc[1] <= 8192) { w = rc[0]; h = rc[1]; } }
-            if (ro > 0) show_frame(g_obj[ro].aux, w, h, k);
+            /* real GPU present (GTA6_GDI=1 keeps the old GDI copy): show what the game's commands did to its back buffer */
+            static int usegdi = -1; if (usegdi < 0) usegdi = GetEnvironmentVariableA("GTA6_GDI", NULL, 0) ? 1 : 0;
+            if (!usegdi && rg_init(FindWindowA(NULL, "Americas"))) {
+                const float* c = ro > 0 ? clear_get(ro) : NULL; static const float black[4] = { 0, 0, 0, 1 };
+                rg_present_clear(c ? c : black);
+                static volatile LONG cl; if (c && InterlockedIncrement(&cl) <= 5) dlog("present: back buffer obj#%d last cleared to %.3f %.3f %.3f %.3f", ro, c[0], c[1], c[2], c[3]);
+            } else if (ro > 0) show_frame(g_obj[ro].aux, w, h, k);
         }
         if (k <= 3 && readable(arg[1], 64)) {
             uint64_t* q = (uint64_t*)arg[1];
@@ -665,6 +706,9 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
                 write_timg((uint32_t*)dst, base, fmt, (uint32_t)*(uint64_t*)(rm->desc + 16), *(uint32_t*)(rm->desc + 24), *(uint16_t*)(rm->desc + 28), *(uint16_t*)(rm->desc + 30), rdim);
             }
             break; }
+        case 20:                                                 /* CreateRenderTargetView(res, desc, handle): remember handle -> resource */
+            what = "RTV"; { int ro = objid(arg[0]); if (ro > 0) rtv_set(arg[2], ro); }
+            break;
         case 24:                                                 /* CopyDescriptorsSimple(n, dstStart, srcStart, type) */
             what = "copy";
             if ((uint32_t)arg[0] <= 65536 && writable(arg[1], (size_t)(uint32_t)arg[0] * 32) && readable(arg[2], (size_t)(uint32_t)arg[0] * 32))
@@ -686,6 +730,9 @@ static uint64_t dprobe(int slot, uint64_t rcx, uint64_t a[11], void* ra) {
                      static int recdata = -1; if (recdata < 0) recdata = GetEnvironmentVariableA("GTA6_REC_DATA", NULL, 0) ? 1 : 0;
                      if (recdata && readable(arg[1], 64)) { extra = 16; src = (const void*)arg[1]; } } break;
         case 35: rec = 1; break;                                 /* Xbox: SetComputeRootDescriptorTable(index, gpuHandle) */
+        case 52: rec = 1; if (readable(arg[1], 16)) { extra = 4; src = (const void*)arg[1]; } break;   /* Xbox ClearRenderTargetView(rtv, color, n, rects) */
+        case 21: rec = 1; if (arg[0] >= 1 && readable(arg[1], 24)) { extra = 6; src = (const void*)arg[1]; } break;  /* RSSetViewports(n, vp): first viewport */
+        case 50: rec = 1; if (arg[0] >= 1 && readable(arg[1], 8)) { extra = 2; src = (const void*)arg[1]; } break;   /* Xbox OMSetRenderTargets(n, handles, ...) */
         case 28 + 1000: break;
         }
         if (slot == 28 && (uint32_t)arg[0] <= 2 && readable(arg[1], 16)) { extra = (uint32_t)arg[0] * 2; src = (const void*)arg[1]; }   /* heap pointers */
