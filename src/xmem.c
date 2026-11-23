@@ -64,7 +64,8 @@ static LONG CALLBACK lazy_veh(EXCEPTION_POINTERS* ep) {
     {   /* known race (instant fake GPU): queue-submit loop reads an entry whose completion object isn't set yet.
            exe+0x24821FE: mov rax,[rcx] with rcx==0, followed by call [rax] (2 bytes) -> resume at exe+0x2482203 */
         uint64_t base = (uint64_t)GetModuleHandleA(NULL);
-        if (GetEnvironmentVariableA("GTA6_RACE_GUARD", NULL, 0) && (uint64_t)r->ExceptionAddress == base + 0x24821FE && ep->ContextRecord->Rcx == 0) {
+        /* on by default: any long stall in PresentX (first pipeline compile, opening pool sections) exposes it. GTA6_NO_RACE_GUARD=1 disables. */
+        if (!GetEnvironmentVariableA("GTA6_NO_RACE_GUARD", NULL, 0) && (uint64_t)r->ExceptionAddress == base + 0x24821FE && ep->ContextRecord->Rcx == 0) {
             static volatile LONG c; LONG k = InterlockedIncrement(&c);
             if (k <= 5 || (k & (k - 1)) == 0) slog_("race-guard: skipped null completion callback in queue submit (count)", r->ExceptionAddress, k, 0, 0, 0, 0, 0);
             ep->ContextRecord->Rip = base + 0x2482203;

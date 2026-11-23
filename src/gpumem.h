@@ -1,5 +1,6 @@
 /* GPU-visible "physical memory" shared by xmem.dll (owner) and d3d12_xs.dll (reader). Enabled by GTA6_GPUMEM=1.
-   Physical pages (64 KB) live in pagefile-backed sections of 2 GB each (D3D12 can open a section under 4 GB as a heap).
+   Physical pages (64 KB) live in pagefile-backed sections of 2 GB each. The GPU sees each section through a private full
+   view opened with OpenExistingHeapFromAddress (heaps must be under 4 GB; OpenExistingHeapFromFileMapping leaks on AMD).
    XMemMapPhysicalPages maps views of those pages into the game's placeholder reservations, so the CPU sees them at the
    game's addresses and the GPU reads the same bytes through the section heaps: zero copy, and aliasing works.
    Page table, two levels over the 48-bit address space:

@@ -94,9 +94,14 @@ static DWORD WINAPI gm_opener(LPVOID unused) {
     while (g_gmem && g_nsecbuf < g_gmem->nsec) {
         int s = g_nsecbuf; ID3D12Device3* d3 = NULL; ID3D12Heap* heap = NULL;
         if (FAILED(ID3D12Device_QueryInterface(g_dev, &IID_ID3D12Device3, (void**)&d3))) break;
-        HRESULT hr = ID3D12Device3_OpenExistingHeapFromFileMapping(d3, (HANDLE)g_gmem->sec[s], &IID_ID3D12Heap, (void**)&heap);
+        /* NOT OpenExistingHeapFromFileMapping: on this driver it leaks the whole section's commit permanently (until reboot),
+           even after full teardown. A private full view of the section + OpenExistingHeapFromAddress is released cleanly,
+           also when the process is killed (tools/heaptest3.c). */
+        void* view = MapViewOfFile((HANDLE)g_gmem->sec[s], FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)GM_SECPAGES * GM_PAGE);
+        if (!view) { rlog("gpumem: view of section %d failed %lu", s, GetLastError()); ID3D12Device3_Release(d3); break; }
+        HRESULT hr = ID3D12Device3_OpenExistingHeapFromAddress(d3, view, &IID_ID3D12Heap, (void**)&heap);
         ID3D12Device3_Release(d3);
-        if (FAILED(hr)) { rlog("gpumem: OpenExistingHeapFromFileMapping(section %d) failed 0x%08lX", s, hr); break; }
+        if (FAILED(hr)) { rlog("gpumem: OpenExistingHeapFromAddress(section %d view) failed 0x%08lX", s, hr); break; }
         D3D12_RESOURCE_DESC rd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, (UINT64)GM_SECPAGES * GM_PAGE, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER };
         hr = ID3D12Device_CreatePlacedResource(g_dev, heap, 0, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void**)&g_secbuf[s]);
         if (FAILED(hr)) { rlog("gpumem: section %d buffer failed 0x%08lX", s, hr); break; }

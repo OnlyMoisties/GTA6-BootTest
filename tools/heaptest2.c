@@ -1,3 +1,5 @@
+/* WARNING: OpenExistingHeapFromFileMapping (used below) leaks the section's commit until reboot on the AMD driver tested,
+   even after full release. Kept only as the record of that finding; use heaptest3.c instead. */
 /* Physical-page pool test: a 16 GB pagefile-backed section is the "physical memory"; 64 KB pages get mapped as
    views into a placeholder reservation (like XMemMapPhysicalPages), and the GPU reads the pool through one heap
    opened with OpenExistingHeapFromFileMapping. Also checks aliasing (two VAs -> same page) and mapping speed.
@@ -23,6 +25,7 @@ int main(void) {
         uint8_t* va = base + i * PG;
         if (i + 1 < npg * 2 && !VirtualFree(va, PG, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) { printf("split %llu failed %lu\n", i, GetLastError()); return 1; }
         if (MapViewOfFile3(sec, GetCurrentProcess(), va, (npg - 1 - i) * PG, PG, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0) != va) { printf("map %llu failed %lu\n", i, GetLastError()); return 1; }
+        if (secflags == SEC_RESERVE && !VirtualAlloc(va, PG, MEM_COMMIT, PAGE_READWRITE)) { printf("commit %llu failed %lu\n", i, GetLastError()); return 1; }
     }
     QueryPerformanceCounter(&t1);
     printf("mapped %llu pages in %.1f ms\n", npg, (t1.QuadPart - t0.QuadPart) * 1000.0 / fr.QuadPart);
@@ -30,11 +33,13 @@ int main(void) {
     uint8_t* alias = base + npg * PG;
     VirtualFree(alias, PG, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
     if (MapViewOfFile3(sec, GetCurrentProcess(), alias, 5 * PG, PG, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0) != alias) { printf("alias map failed %lu\n", GetLastError()); return 1; }
+    if (secflags == SEC_RESERVE) VirtualAlloc(alias, PG, MEM_COMMIT, PAGE_READWRITE);
     for (uint64_t i = 0; i < npg; i++) *(uint64_t*)(base + i * PG + 128) = 0xABCD000000000000ull | i;
     printf("alias sees VA page %llu value: %llX (expect %llX)\n", npg - 1 - 5, *(uint64_t*)(alias + 128), 0xABCD000000000000ull | (npg - 1 - 5));
     /* unmap one page back to a placeholder, and remap it */
     if (!UnmapViewOfFile2(GetCurrentProcess(), base, MEM_PRESERVE_PLACEHOLDER)) { printf("unmap failed %lu\n", GetLastError()); return 1; }
     if (MapViewOfFile3(sec, GetCurrentProcess(), base, (npg - 1) * PG, PG, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0) != base) { printf("remap failed %lu\n", GetLastError()); return 1; }
+    if (secflags == SEC_RESERVE) VirtualAlloc(base, PG, MEM_COMMIT, PAGE_READWRITE);
 
     ID3D12Device* dev; CHK(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_12_0, &IID_ID3D12Device, (void**)&dev));
     ID3D12Device3* d3; CHK(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device3, (void**)&d3));
@@ -62,5 +67,13 @@ int main(void) {
     int bad = 0;
     for (int k = 0; k < 4; k++) { uint64_t want = 0xABCD000000000000ull | (npg - 1 - probe[k]); printf("phys page %5llu: GPU %llX  want %llX\n", probe[k], m[k], want); bad += m[k] != want; }
     printf("result: %s, removed reason 0x%08lX\n", bad ? "WRONG" : "OK", (unsigned long)ID3D12Device_GetDeviceRemovedReason(dev));
+    if (GetEnvironmentVariableA("RELEASE", NULL, 0)) {      /* explicit teardown: does the section still leak? */
+        ID3D12Resource_Unmap(dst, 0, NULL); ID3D12Resource_Release(dst); ID3D12Resource_Release(src); ID3D12Heap_Release(heap);
+        ID3D12GraphicsCommandList_Release(cl); ID3D12CommandAllocator_Release(al); ID3D12CommandQueue_Release(q); ID3D12Fence_Release(f);
+        ID3D12Device3_Release(d3); ULONG rc = ID3D12Device_Release(dev);
+        for (uint64_t i = 0; i < npg; i++) UnmapViewOfFile2(GetCurrentProcess(), base + i * PG, 0);
+        UnmapViewOfFile2(GetCurrentProcess(), alias, 0); CloseHandle(sec);
+        printf("released everything (device refcount now %lu)\n", rc);
+    }
     return bad;
 }
