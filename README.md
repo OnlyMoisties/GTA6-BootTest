@@ -2,7 +2,7 @@
 
 Stand-in DLLs and a debugger harness that boot the Xbox Series X|S build of GTA VI (`game_scarlett_master.exe`, GDK) on Windows, plus an RDNA2 shader translator and a real-GPU path that runs the game's draws on a PC graphics card.
 
-**This repository contains no game code or data.** You need your own copy of the build. It is not playable yet. The game boots, streams its archives, runs its frame loop and submits real GPU work, but the image is still black: UI vertex bindings, rect lists, compute and tiled textures are not finished.
+**This repository contains no game code or data.** You need your own copy of the build. It is not playable yet. The game boots, streams its archives, runs its frame loop and renders its first UI screen (the start-screen prompt bar) through translated shaders on the PC GPU. Compute, tiled textures, blending and later loading stages are not finished.
 
 The technical findings are in [REPORT.md](REPORT.md).
 
@@ -37,9 +37,12 @@ run.bat "X:\path\to\game_scarlett_master.exe"
 
 Or set `GTA6_GAME_EXE` once instead of passing the path. Logs go to `logs\harness.log` and `logs\stubs.log`.
 
-Real-GPU run: translate the logged shaders, then run with the pool enabled.
+Real-GPU run: compile the helper shaders into `bin`, translate the logged shaders, then run with the pool enabled.
 
 ```
+dxc -T vs_6_6 -E vs tools/blit.hlsl -Fo bin/blit_vs.cso
+dxc -T ps_6_6 -E ps tools/blit.hlsl -Fo bin/blit_ps.cso
+dxc -T gs_6_6 -E main tools/rect_gs.hlsl -Fo bin/rect_gs.cso
 python -I tools/xlat_needed.py third_party/amd_isa/amdgpu_isa_rdna2.xml logs logs/xlat third_party/dxc/bin/x64/dxc.exe
 set GTA6_GPUMEM=1
 set GTA6_XLAT_DIR=<repo>\logs\xlat
@@ -64,7 +67,8 @@ set GTA6_BLIT_DIR=<repo>\bin
 | `GTA6_D3D_DEBUG=1` | D3D12 debug layer, messages logged |
 | `GTA6_DRAWLOG=1`, `GTA6_PSO57DUMP=1`, `GTA6_VSDEBUG=1` | Per-draw logs, pipeline dumps, vertex-shader output readback |
 | `GTA6_SHOT=1` | Screenshots and render-target dumps at fixed frames |
-| `GTA6_SRV_FROM_CB=1` | Experiment: fill buffer-SRV table slots from the bound CBV |
+| `GTA6_NO_SRV_FROM_CB=1` | Don't fill empty buffer-SRV table slots from the table's CBV descriptor |
+| `GTA6_GPUMEM_NOVA=1` | Keep `PAGE_GRAPHICS_*` allocations as private memory instead of pool pages |
 
 ## Notes
 
@@ -72,7 +76,7 @@ set GTA6_BLIT_DIR=<repo>\bin
 
 ## Not done
 
-- UI draw bindings (pipeline metadata kind `0x300`), rect-list expansion
+- Blend state from the pipeline's render-state block; screens after the start screen go black again
 - Compute dispatch on the real GPU, tiled/swizzled textures
 - DirectStorage formats `0x02` / `0x0E` (Series texture codecs)
 - Saves, input mapping, audio output
