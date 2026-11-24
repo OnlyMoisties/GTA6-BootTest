@@ -164,6 +164,19 @@ EXP void* XMemVirtualAlloc(void* addr, size_t size, uint64_t type, uint64_t a4, 
         void* p = va2()(NULL, addr, size, MEM_RESERVE | X_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
         if (p) { res_add(p, size, 1); SLOG("XMemVirtualAlloc[gpu placeholder]", addr, size, type, a4, a5, p); return p; }
     }
+    /* Committed allocations with PAGE_GRAPHICS_* protection (0x800..0x10000: GPU readable/writable) hold vertex/index data,
+       upload rings and other buffers the GPU reads: back them with pool pages up front so the real GPU sees the same bytes.
+       GTA6_GPUMEM_NOVA=1 keeps them as ordinary private memory. */
+    if (gpumem_on() && !addr && (t & MEM_COMMIT) && (t & MEM_RESERVE) && ((uint32_t)a5 & 0x1F800) && va2() && !GetEnvironmentVariableA("GTA6_GPUMEM_NOVA", NULL, 0)) {
+        size_t sz = (size + 0xFFFF) & ~(size_t)0xFFFF;
+        uint8_t* p = (uint8_t*)va2()(NULL, NULL, sz, MEM_RESERVE | X_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
+        if (p) {
+            size_t o = 0; for (; o < sz; o += 0x10000) if (!gm_map_page((uint64_t)p + o, (uint64_t)InterlockedIncrement64(&g_nextpfn))) break;
+            if (o == sz) { res_add(p, sz, 1); SLOG("XMemVirtualAlloc[gpu-visible commit -> pool]", addr, size, type, a4, a5, p); return p; }
+            slog_("gpu-visible commit: pool mapping failed part way (size, mapped) - range kept, rest lazily mapped", 0, sz, o, 0, 0, 0, 0);
+            res_add(p, sz, 1); return p;
+        }
+    }
     if (gpumem_on() && addr && (t & MEM_COMMIT)) {          /* commit inside a GPU placeholder range: map pool pages there */
         uint64_t a0 = (uint64_t)addr & ~0xFFFFull, a1 = ((uint64_t)addr + size + 0xFFFF) & ~0xFFFFull; LONG n = g_nres; if (n > 256) n = 256;
         for (LONG i = 0; i < n; i++) if (g_res[i].phys && a0 >= g_res[i].base && a1 <= g_res[i].base + g_res[i].size) {

@@ -439,7 +439,7 @@ static int make_xrs(void) {
 }
 /* topo: D3D_PRIMITIVE_TOPOLOGY value; rtf: render target format (back buffer when drawing without the cache) */
 static ID3D12PipelineState* get_xpso(uint64_t vh, uint64_t ph, int topo, DXGI_FORMAT rtf) {
-    int tt = (topo == 1) ? 1 : (topo == 2 || topo == 3) ? 2 : 3;      /* point, line, triangle */
+    int tt = (topo == 1) ? 1 : (topo == 2 || topo == 3) ? 2 : (topo == 17) ? 4 : 3;      /* point, line, triangle, rect list (triangles + rect_gs) */
     for (int i = 0; i < g_nxpsos; i++) if (g_xpsos[i].vh == vh && g_xpsos[i].ph == ph && g_xpsos[i].topo == tt && g_xpsos[i].rtf == rtf) return g_xpsos[i].pso;
     if (g_nxpsos >= XPSO_MAX) return NULL;
     XPso* e = &g_xpsos[g_nxpsos++]; e->vh = vh; e->ph = ph; e->topo = tt; e->rtf = rtf; e->pso = NULL;
@@ -456,6 +456,12 @@ static ID3D12PipelineState* get_xpso(uint64_t vh, uint64_t ph, int topo, DXGI_FO
     d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; d.RasterizerState.DepthClipEnable = TRUE;
     d.PrimitiveTopologyType = tt == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT : tt == 2 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     d.NumRenderTargets = 1; d.RTVFormats[0] = rtf; d.SampleDesc.Count = 1;
+    static void* gs; static size_t lg; static int gstried;       /* rect lists: bin/rect_gs.cso (tools/rect_gs.hlsl) adds the fourth corner */
+    if (tt == 4) {
+        if (!gstried++) { char gp[MAX_PATH]; if (GetEnvironmentVariableA("GTA6_BLIT_DIR", gp, MAX_PATH - 20)) { strcat(gp, "\\rect_gs.cso"); gs = load_file(gp, &lg); }
+            rlog("rect-list geometry shader: %s", gs ? "loaded" : "missing (rect lists draw as one triangle)"); }
+        if (gs) { d.GS.pShaderBytecode = gs; d.GS.BytecodeLength = lg; }
+    }
     HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(g_dev, &d, &IID_ID3D12PipelineState, (void**)&e->pso);
     static int nl; if (nl++ < 40 || FAILED(hr)) rlog("pipeline from TRANSLATED shaders vs %016llX + ps %016llX (rt format %u): %s 0x%08lX", vh, ph, rtf, SUCCEEDED(hr) ? "OK" : "FAILED", hr);
     free(vs); free(ps);

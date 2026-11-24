@@ -537,7 +537,10 @@ static void replay_list(int lid) {
                             uint32_t* e = (uint32_t*)(tc + (uint64_t)gm->cboff[k] * 4);
                             uint64_t src = 0; int kk = gm->cbkind[k] == 0x300 ? 1 : 0;
                             for (int pi = 0; pi < 16 && !src; pi++) src = gvk[kk][pi];
-                            if (kk && GetEnvironmentVariableA("GTA6_SRV_FROM_CB", NULL, 0)) {   /* experiment: buffer SRV from the table's CBV descriptor */
+                            /* an empty buffer-SRV slot with no root SRV bound: use the table's own CBV descriptor (its buffer starts with the
+                               world rows the vertex shaders read from the SRV). GTA6_NO_SRV_FROM_CB=1 turns this off. */
+                            static int nosfc = -1; if (nosfc < 0) nosfc = GetEnvironmentVariableA("GTA6_NO_SRV_FROM_CB", NULL, 0) ? 1 : 0;
+                            if (kk && !src && !nosfc && writable((uint64_t)e, 16) && !e[0] && !e[1]) {
                                 for (int k2 = 0; k2 < gm->ncb; k2++) if (gm->cbkind[k2] == 0x302) { const uint32_t* cbd = (const uint32_t*)(tc + (uint64_t)gm->cboff[k2] * 4);
                                     if (readable((uint64_t)cbd, 16) && (cbd[0] || cbd[1])) { memcpy(e, cbd, 16); src = 0; break; } }
                                 if (e[0] || e[1]) { static volatile LONG nx; if (InterlockedIncrement(&nx) <= 3) dlog("SRV from CBV descriptor: table %llX dword %u", gtab[0], gm->cboff[k]); continue; }
@@ -575,7 +578,9 @@ static void replay_list(int lid) {
         case 33: rootsig = objid(h->a[0]); break;                               /* SetComputeRootSignature */
         case 28: for (uint32_t i = 0; i < h->nextra / 2 && i < 2; i++) heaps[i] = ((const uint64_t*)ex)[i]; break;
         case 35: if (h->a[0] < 16) tables[h->a[0]] = gpu2cpu(h->a[1]); break;   /* SetComputeRootDescriptorTable */
-        case 34: grs = objid(h->a[0]); break;                                    /* SetGraphicsRootSignature */
+        case 34: { int nrs = objid(h->a[0]);                                    /* SetGraphicsRootSignature: a new signature clears the root arguments */
+            if (nrs != grs) { memset(gtab, 0, sizeof gtab); memset(gview, 0, sizeof gview); memset(gvk, 0, sizeof gvk); memset(gconst, 0, sizeof gconst); }
+            grs = nrs; break; }
         case 20: gprim = (int)h->a[0]; break;                                     /* IASetPrimitiveTopology */
         case 36: if (h->a[0] < 16) gtab[h->a[0]] = h->a[1]; break;              /* SetGraphicsRootDescriptorTable (GPU handle, low alias) */
         case 38: if (h->a[0] < 16 && h->a[2] < 64) gconst[h->a[0]][h->a[2]] = (uint32_t)h->a[1]; break;
